@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -270,6 +271,20 @@ class Fp8Config(QuantizationConfig):
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+                from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                    Mxfp4MarlinMoEMethod,
+                )
+
+                return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+
+            # SM120 NVFP4: use triton backend for FP8-compatible weight loading,
+            # then re-quantize FP8→NVFP4 in process_weights_after_loading.
+            # SGLANG_DSV4_FP4_EXPERTS must be 0 so weight buffers are FP8-sized.
+            if (
+                os.environ.get("SGLANG_FP4_MOE_NVFP4", "0") == "1"
+                and not self.is_fp4_experts
+                and get_moe_runner_backend().is_triton()
+            ):
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, List
 
@@ -36,6 +37,90 @@ async def execute_warmups(
             continue
         logger.info(f"Running warmup {warmup_name}")
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+
+
+def _make_warmup_req(
+    size: int,
+    max_new_tokens: int = 30,
+    disaggregation_mode: str = "null",
+) -> GenerateReqInput:
+    """Create a warmup GenerateReqInput with random input_ids."""
+    req = GenerateReqInput(
+        input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+        sampling_params={
+            "max_new_tokens": max_new_tokens,
+            "temperature": 0.8,
+            "stop_token_ids": [1],
+            "min_p": 0.0,
+        },
+    )
+    if disaggregation_mode != "null":
+        req.bootstrap_room = 0
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    return req
+
+
+async def _drain_one(tokenizer_manager: TokenizerManager, req: GenerateReqInput):
+    """Send one request and drain it (wait for first token)."""
+    await tokenizer_manager.generate_request(req, None).__anext__()
+
+
+@warmup("moe_w4a4")
+async def moe_w4a4(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Warm up CuTe-DSL NVFP4 (W4A4) MoE kernels for SM120 Blackwell.
+
+    Strategy: static kernel (bucketed) for decode, dynamic for prefill.
+    - Static: m-bucketing limits unique compilations to ~17 sizes
+    - Dynamic: shape-agnostic, compiles once on first use
+
+    Phase 1: Single request — calibration + dynamic kernel compile (prefill)
+    Phase 2: Concurrent decode at 2, then 8 — static/micro kernel compilation
+    Phase 3: Full concurrency verification
+    """
+    MAX_CONCURRENT = 8
+    DECODE_TOKENS = 16
+
+    # Phase 1: single request for calibration + dynamic kernel compile
+    logger.info(
+        "moe_w4a4 warmup: Phase 1/3 — single request "
+        "(calibration + first kernel compile)..."
+    )
+    req = _make_warmup_req(256, max_new_tokens=DECODE_TOKENS,
+                           disaggregation_mode=disaggregation_mode)
+    await _drain_one(tokenizer_manager, req)
+    logger.info("moe_w4a4 warmup: Phase 1/3 complete.")
+
+    # Phase 2: concurrent requests to trigger static/micro kernel compilation
+    # for decode bucket sizes (m=1..8 in decode).
+    for concurrency in (2, MAX_CONCURRENT):
+        logger.info(
+            f"moe_w4a4 warmup: Phase 2/3 — {concurrency} concurrent requests "
+            f"(batch decode kernel compile)..."
+        )
+        reqs = [
+            _make_warmup_req(256, max_new_tokens=DECODE_TOKENS,
+                             disaggregation_mode=disaggregation_mode)
+            for _ in range(concurrency)
+        ]
+        tasks = [_drain_one(tokenizer_manager, r) for r in reqs]
+        await asyncio.gather(*tasks)
+    logger.info("moe_w4a4 warmup: Phase 2/3 complete.")
+
+    # Phase 3: full concurrency verification — should be fast
+    logger.info(
+        f"moe_w4a4 warmup: Phase 3/3 — {MAX_CONCURRENT} concurrent requests "
+        f"(verification, should be fast)..."
+    )
+    reqs = [
+        _make_warmup_req(512, max_new_tokens=DECODE_TOKENS,
+                         disaggregation_mode=disaggregation_mode)
+        for _ in range(MAX_CONCURRENT)
+    ]
+    tasks = [_drain_one(tokenizer_manager, r) for r in reqs]
+    await asyncio.gather(*tasks)
+    logger.info("moe_w4a4 warmup: Phase 3/3 complete. All kernels warm.")
 
 
 @warmup("whisper_autodetect")

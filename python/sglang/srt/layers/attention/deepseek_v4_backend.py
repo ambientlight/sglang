@@ -56,12 +56,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_sm120 = is_sm120_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
+    if _is_sm120:
+        return None
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
@@ -1045,24 +1050,38 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            if _is_sm120:
+                # Direct call to HMMA tensor-core sparse decode kernel
+                import sys as _sys
+                if '/mnt/hot/ambientlight/deepseek-v4-flash-sm120/build-docker' not in _sys.path:
+                    _sys.path.insert(0, '/mnt/hot/ambientlight/deepseek-v4-flash-sm120/build-docker')
+                from deepseek_v4_kernel.ops import sparse_decode_fwd as _hmma_fwd
+                _sm = self.softmax_scale if self.softmax_scale is not None else q.shape[-1] ** (-0.5)
+                o, _lse, _, _ = _hmma_fwd(
+                    q, swa_k_cache, swa_page_indices, swa_topk_lengths,
+                    attn_sink, None, None,
+                    extra_k_cache, extra_indices, extra_topk_lengths,
+                    self.head_dim_v, float(_sm),
+                )
+            else:
+                import flash_mla
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
 
             o = o.squeeze(1)
             return o

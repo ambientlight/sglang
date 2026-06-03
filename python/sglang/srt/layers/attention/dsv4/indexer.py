@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -87,6 +88,79 @@ def fp8_paged_mqa_logits_torch(
         score = score.sum(dim=1)
         score *= kvcache_scale
         logits[i, :seq_len] = score[:seq_len]
+
+    return logits
+
+
+def fp8_paged_mqa_logits_torch_sm120(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """CUDA-graph-compatible FP8 paged MQA logits for SM120.
+
+    Processes each request independently to avoid OOM from batched BMM.
+    Loop over batch_size is graph-safe (fixed iteration count per captured BS).
+    """
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
+
+    assert head_dim == 128
+    assert block_size == 64
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    max_pages = (max_seq_len + block_size - 1) // block_size
+    max_padded_seq = max_pages * block_size
+
+    kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    SCALE_OFFSET = block_size * head_dim
+
+    q = q_fp8[:, 0].to(torch.float32)  # [B, H, D]
+
+    logits = q.new_full((batch_size, max_seq_len), float("-inf"))
+    positions = torch.arange(max_seq_len, device=device)
+
+    # Process each request individually to avoid OOM from batched gather+BMM
+    for i in range(batch_size):
+        page_ids_i = page_table[i, :max_pages]  # [max_pages]
+        kv_gathered_i = kvcache_flat[page_ids_i]  # [max_pages, block_size*(D+4)]
+
+        kv_val_raw = kv_gathered_i[:, :SCALE_OFFSET]
+        kv_sc_raw = kv_gathered_i[:, SCALE_OFFSET:]
+
+        kv_val = kv_val_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+        kv_val = kv_val.view(max_padded_seq, head_dim)  # [seq, D]
+
+        kv_sc = kv_sc_raw.contiguous().view(dtype=torch.float32)
+        kv_sc = kv_sc.view(max_padded_seq)  # [seq]
+
+        # score[seq] = sum_h( relu(kv[seq] @ q[h]) * weight[h] ) * scale[seq]
+        qi = q[i]  # [H, D]
+        score_i = torch.mv(kv_val, qi[0])  # start with head 0: [seq, D] @ [D] = [seq]
+        # Actually need: [seq, D] @ [H, D].T = [seq, H], then relu, weight, sum
+        scores_all_heads = kv_val @ qi.t()  # [seq, H]
+        scores_all_heads = F.relu(scores_all_heads)
+        scores_all_heads = scores_all_heads * weight[i].unsqueeze(0)  # [seq, H] * [1, H]
+        score_i = scores_all_heads.sum(dim=1)  # [seq]
+        score_i = score_i * kv_sc
+
+        out_width = min(max_padded_seq, max_seq_len)
+        logits[i, :out_width] = score_i[:out_width]
+        logits[i].masked_fill_(positions >= seq_lens[i], float("-inf"))
 
     return logits
 
@@ -369,11 +443,19 @@ class C4IndexerBackendMixin:
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
+            if is_sm120_supported():
+                from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits as fn,
+                )
+            else:
+                from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits as fn,
+                )
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            fn = fp8_paged_mqa_logits_torch
+            if is_sm120_supported():
+                fn = fp8_paged_mqa_logits_torch_sm120
+            else:
+                fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
