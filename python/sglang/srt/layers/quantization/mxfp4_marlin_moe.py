@@ -417,6 +417,9 @@ class Mxfp4MarlinMoEMethod:
             if not getattr(layer, "_nvfp4_calibrated", False):
                 self._calibrate_nvfp4(layer, hidden_states, topk_output)
 
+            import time as _time
+            _t0 = _time.monotonic()
+
             from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
                 launch_sm120_static_moe,
                 launch_sm120_dynamic_moe,
@@ -424,6 +427,8 @@ class Mxfp4MarlinMoEMethod:
                 _get_weight_views,
                 _get_cached_workspace,
             )
+
+            _t1 = _time.monotonic()
 
             M = hidden_states.shape[0]
             K = layer._nvfp4_K
@@ -447,18 +452,29 @@ class Mxfp4MarlinMoEMethod:
                 activation_precision="fp4",
             )
 
+            _t2 = _time.monotonic()
+
             backend = select_sm120_moe_backend(
                 num_tokens=M, num_topk=top_k, activation_precision="fp4",
             )
             if backend == "dynamic" and E_local != 256:
                 backend = "static"
 
+            _t3 = _time.monotonic()
+
+            # For static backend: cap routed_rows to ensure workspace is large
+            # enough for any batch, avoiding workspace growth → RT kernel
+            # recompilation. Static cutover is 640 routed rows, so cap there.
+            ws_routed_rows = max(routed_rows, 640) if backend == "static" else routed_rows
+
             workspace = _get_cached_workspace(
                 backend=backend, state_E=E_local, weight_E=256,
-                routed_rows=routed_rows, k=K, n=I, num_topk=top_k,
+                routed_rows=ws_routed_rows, k=K, n=I, num_topk=top_k,
                 device=hidden_states.device, activation_precision="fp4",
                 quant_mode="nvfp4", activation="silu",
             )
+
+            _t4 = _time.monotonic()
 
             launch_fn = (launch_sm120_dynamic_moe if backend == "dynamic"
                          else launch_sm120_static_moe)
@@ -478,6 +494,19 @@ class Mxfp4MarlinMoEMethod:
                 activation="silu",
                 activation_precision="fp4",
             )
+
+            _t5 = _time.monotonic()
+            _total = _t5 - _t0
+            if _total > 0.1:  # only log slow calls (>100ms)
+                log_info_on_rank0(
+                    logger,
+                    f"NVFP4 MoE SLOW: total={_total:.3f}s "
+                    f"import={_t1-_t0:.3f} weights={_t2-_t1:.3f} "
+                    f"select={_t3-_t2:.3f} workspace={_t4-_t3:.3f} "
+                    f"launch={_t5-_t4:.3f} M={M} backend={backend} "
+                    f"layer={self.prefix}",
+                )
+
             return StandardCombineInput(hidden_states=output)
 
         # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
