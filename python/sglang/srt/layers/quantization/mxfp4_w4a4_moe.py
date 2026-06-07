@@ -31,6 +31,7 @@ Selected by ``fp8.py`` when: SM120 + native MXFP4 experts + the env flag
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -216,6 +217,42 @@ class Mxfp4W4A4MoEMethod:
         layer._w4a4_I = I
         layer._w4a4_E = E
         layer._w4a4_weights_built = True
+
+        # Pre-materialize the FlashInfer weight views ONCE here (at load time),
+        # not lazily inside apply()/CUDA-graph capture. _get_weight_views builds
+        # contiguous swizzled scale storage (~48 MB/layer) and caches it in
+        # _WEIGHT_CACHE keyed by data_ptr; if first built during capture those
+        # ~2 GB (×43 layers) land in the graph-private pool. Building them now
+        # keeps them as ordinary pre-capture model state (mirrors NVFP4 marlin).
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _get_weight_views,
+        )
+
+        ones_e = torch.ones(E, device=layer.w13_weight.device, dtype=torch.float32)
+        layer._w4a4_alpha = ones_e  # GEMM alpha = 1 (MXF4 self-scales); reused
+        layer._w4a4_weight_views = _get_weight_views(
+            w1_fp4=layer.w13_weight,
+            w1_blockscale=layer.w13_weight_scale_inv,
+            w2_fp4=layer.w2_weight,
+            w2_blockscale=layer.w2_weight_scale_inv,
+            w1_alphas=ones_e,
+            w2_alphas=ones_e,
+            n=I,
+            k=H,
+            activation_precision="fp4",
+            quant_mode="mxfp4",
+        )
+
+        # Release the large per-layer transients (f32 scale upcasts, the
+        # torch.cat weight copies ~2 GB each, swizzle/MMA temps). The final
+        # Parameters above hold .contiguous() copies, so every intermediate is
+        # dead here. Without this the caching allocator keeps ~8-10 GB/GPU of
+        # high-water reserve across 43 layers, starving CUDA-graph capture and
+        # long-context attention (mirrors the NVFP4 marlin cleanup).
+        del w13, w2, w13_s, w2_s
+        del w13_s_u8, w2_s_u8, w13_s_sw, w2_s_sw, w13_sf_mma, w2_sf_mma
+        torch.cuda.empty_cache()
+
         log_info_on_rank0(
             logger,
             f"SM120 W4A4-mx: native MXFP4 experts ready "
@@ -231,6 +268,8 @@ class Mxfp4W4A4MoEMethod:
     ) -> "CombineInput":
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
             launch_sm120_moe,
+            _get_cached_workspace,
+            select_sm120_moe_backend,
         )
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
@@ -255,9 +294,45 @@ class Mxfp4W4A4MoEMethod:
 
         cfg = getattr(self.runner, "config", None)
 
-        # MXF4 self-scales: no FC1/FC2 activation global scale. Pass ones for the
-        # alphas (GEMM alpha = 1) and fc2_input_scale (kernel divides by it=1).
-        ones = torch.ones(E_global, device=dev, dtype=torch.float32)
+        # MXF4 self-scales: no FC1/FC2 activation global scale. Reuse the alpha
+        # ones tensor built at load time (GEMM alpha = 1, fc2_input_scale = 1).
+        ones = layer._w4a4_alpha
+
+        # Pre-materialize ONE capped STATIC workspace per (layer-config, top_k)
+        # so decode batches use a workspace allocated OUTSIDE CUDA-graph capture
+        # that never grows with live routed_rows. The cap (>= the static/dynamic
+        # cutover, 640) covers all static-path batches; mirrors the NVFP4 marlin
+        # SGLANG_NVFP4_STATIC_WS_CAP pattern. _WORKSPACE_CACHE is process-global
+        # by shape, so the first layer allocates and the rest hit the cache.
+        #
+        # Larger batches (prefill) select the "dynamic" backend or need a static
+        # workspace with > cap rows; for those we pass _workspace=None and let
+        # launch_sm120_moe allocate the correct one (passing a static workspace
+        # would force the static backend with insufficient capacity).
+        ws_cap = int(os.environ.get("SGLANG_MXFP4_STATIC_WS_CAP", "640"))
+        routed_rows = M * top_k
+        ws_key = getattr(layer, "_w4a4_ws_key", None)
+        if ws_key != top_k:
+            layer._w4a4_static_ws = _get_cached_workspace(
+                backend="static",
+                state_E=E_local,
+                weight_E=E_global,
+                routed_rows=ws_cap,
+                k=H,
+                n=I,
+                num_topk=top_k,
+                device=dev,
+                quant_mode="mxfp4",
+                activation="silu",
+            )
+            layer._w4a4_ws_key = top_k
+
+        backend = select_sm120_moe_backend(
+            num_tokens=M, num_topk=top_k, quant_mode="mxfp4"
+        )
+        # EP forces static (kernel needs global->local remap); match the launcher.
+        use_static = backend == "static" and routed_rows <= ws_cap
+        workspace = layer._w4a4_static_ws if use_static else None
 
         output = torch.empty(M, H, dtype=hidden_states.dtype, device=dev)
         launch_sm120_moe(
@@ -279,6 +354,8 @@ class Mxfp4W4A4MoEMethod:
             fast_math=True,
             activation="silu",
             quant_mode="mxfp4",
+            _weight_views=layer._w4a4_weight_views,
+            _workspace=workspace,
         )
 
         routed_scaling_factor = (
