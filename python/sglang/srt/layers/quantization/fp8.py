@@ -270,6 +270,38 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
+            # SM120 native MXFP4 x MXFP4 (W4A4-mx): load DeepSeek-V4-Flash experts
+            # as-is (E2M1 int8 + E8M0 scales) and run the FUSED SwiGLU CuTe-DSL MoE
+            # kernels (launch_sm120_moe quant_mode="mxfp4") — MXFP4 weights x MXFP4
+            # activations, E8M0 self-scaling. No re-quant, no calibration. Opt-in
+            # via SGLANG_MXFP4_W4A4=1; takes precedence over W4A8-mx. Leaves the
+            # NVFP4/Marlin and W4A8-mx paths untouched for A/B.
+            if (
+                os.environ.get("SGLANG_MXFP4_W4A4", "0") == "1"
+                and self.is_fp4_experts
+                and is_sm120_supported()
+            ):
+                from sglang.srt.layers.quantization.mxfp4_w4a4_moe import (
+                    Mxfp4W4A4MoEMethod,
+                )
+
+                return Mxfp4W4A4MoEMethod(fp8_method, prefix=prefix)
+
+            # SM120 native MXFP4 (W4A8-mx): load DeepSeek-V4-Flash experts as-is
+            # (E2M1 int8 + E8M0 scales) and run FlashInfer's tensor-core grouped
+            # GEMM with MXFP8 activations. No re-quant, no calibration. Opt-in via
+            # SGLANG_MXFP4_W4A8=1; leaves the NVFP4/Marlin paths untouched (A/B).
+            if (
+                os.environ.get("SGLANG_MXFP4_W4A8", "0") == "1"
+                and self.is_fp4_experts
+                and is_sm120_supported()
+            ):
+                from sglang.srt.layers.quantization.mxfp4_w4a8_moe import (
+                    Mxfp4W4A8MoEMethod,
+                )
+
+                return Mxfp4W4A8MoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
