@@ -314,16 +314,21 @@ def flash_decode_with_gqa_share_sparse(
     use_tma: bool = True,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
-    # dtype check. Q is always bf16/fp16. On HIP, the paged main K/V cache may
-    # be fp8 (unit-scaled) when running with --kv-cache-dtype fp8_*; the kernel
-    # widens it to the Q dtype on load (IS_FP8 branch). Keep CUDA's pre-existing
-    # sparse decode dtype contract unchanged by accepting fp8 only on HIP.
+    # dtype check. Q is always bf16/fp16. The paged MAIN K/V cache may be fp8
+    # (unit-scaled) when running with --kv-cache-dtype fp8_*; the kernel widens
+    # it to the Q dtype on load (IS_FP8 branch). This is enabled on CUDA/SM120
+    # too (not just HIP): MiniMaxSparseKVPool keeps the INDEX KV at the model
+    # bf16 dtype (index_dtype=self.dtype) while only the main KV follows
+    # --kv-cache-dtype, so the fp8-free indexer kernels are never reached. The
+    # main K/V here is unit-scaled fp8 (set_kv_buffer casts with no scale) so the
+    # widening cast is the full dequant. Official MiniMax-M3 vLLM recipe documents
+    # fp8 KV as lossless across the full native context.
     assert q.dtype in (torch.bfloat16, torch.float16)
     _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
-    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
+    is_fp8 = k_cache.dtype in _FP8_DTYPES
     assert k_cache.dtype == q.dtype or is_fp8, (
         f"sparse decode expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8 on HIP, got {k_cache.dtype}"
+        f"or fp8 (e4m3/e5m2), got {k_cache.dtype}"
     )
     assert v_cache.dtype == k_cache.dtype
     # shape
