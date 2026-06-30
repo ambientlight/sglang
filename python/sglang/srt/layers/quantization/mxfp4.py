@@ -369,6 +369,36 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
+                # Native MXFP4 W4A4 (flashinfer launch_sm120_moe, fused clamped
+                # SwiGLU-OAI) replaces the slow Marlin W4A16 dequant on SM120 for
+                # M3's routed experts. Falls back to Marlin if the SM120 kernel
+                # isn't available, or if SGLANG_M3_FORCE_MARLIN=1 (A/B knob).
+                _force_marlin = os.environ.get(
+                    "SGLANG_M3_FORCE_MARLIN", ""
+                ).lower() in ("1", "true", "yes")
+                if not _force_marlin:
+                    try:
+                        from sglang.srt.utils.common import is_sm120_supported
+
+                        if is_sm120_supported():
+                            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (  # noqa: E501,F401
+                                launch_sm120_moe,
+                            )
+                            from sglang.srt.layers.quantization.mxfp4_w4a4_moe import (
+                                Mxfp4W4A4MoEMethod,
+                            )
+
+                            return Mxfp4W4A4MoEMethod(
+                                fp8_method=None, prefix=prefix
+                            )
+                    except Exception as _e:  # pragma: no cover - safe fallback
+                        import logging as _logging
+
+                        _logging.getLogger(__name__).warning(
+                            "Native SM120 MXFP4 MoE unavailable (%r); "
+                            "falling back to Marlin W4A16.",
+                            _e,
+                        )
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()

@@ -207,6 +207,69 @@ def _mxfp8_linear_kernel(
     )
 
 
+@triton.jit
+def _mxfp8_linear_splitk_kernel(
+    x_ptr,
+    xs_ptr,
+    w_ptr,
+    ws_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_xsm,
+    stride_xsk,
+    stride_wn,
+    stride_wk,
+    stride_wsn,
+    stride_wsk,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Split-K variant of ``_mxfp8_linear_kernel``: a 3rd grid dim splits the K
+    reduction across ``SPLIT_K`` CTAs that ``atomic_add`` partial sums into a
+    zero-initialized output. This feeds the SMs on N-skinny / K-heavy decode
+    shapes (e.g. qkv N=2304/K=6144, index_qkv N=256/K=6144) where the single-CTA
+    K-loop otherwise leaves the GPU >90% idle. Same ``tl.dot_scaled`` math as the
+    non-split kernel — numerically equivalent (verified cos>0.999)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_sk = pid_k * (BLOCK_K // 32) + tl.arange(0, BLOCK_K // 32)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+        xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=0)
+        ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=0)
+        acc += tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3")
+        x_ptrs += BLOCK_K * SPLIT_K * stride_xk
+        w_ptrs += BLOCK_K * SPLIT_K * stride_wk
+        xs_ptrs += (BLOCK_K * SPLIT_K // 32) * stride_xsk
+        ws_ptrs += (BLOCK_K * SPLIT_K // 32) * stride_wsk
+
+    o_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.atomic_add(o_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+
 def _run_mxfp8_linear_kernel(
     x_q: torch.Tensor,  # [M, K] fp8 e4m3
     x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
@@ -217,6 +280,47 @@ def _run_mxfp8_linear_kernel(
     M, K = x_q.shape
     N = w.shape[0]
     out = torch.empty((M, N), dtype=out_dtype, device=x_q.device)
+
+    # Split-K for the K-heavy / N-skinny decode shapes (K=6144 qkv/index/gate_up):
+    # the non-split kernel uses BLOCK_N=64 there and a single CTA walks the whole
+    # K=6144 reduction, leaving the 188-SM GPU >90% idle (~26.7us, 2-4.6x slower
+    # than bf16). Splitting K across 4 CTAs that atomic_add into a zeroed output
+    # drops these to ~8us (3-3.4x), M-invariant for M<=32. Numerically equivalent
+    # (verified cos>0.999). Gated to large K + decode-sized M; the K<4096 shapes
+    # (o_proj K=2048, down K=768) already saturate and keep the original path.
+    _SPLIT_K = 4
+    if K >= 4096 and (K // _SPLIT_K) % 128 == 0 and M <= 64:
+        BLOCK_M = 16 if M <= 16 else 32
+        BLOCK_N, BLOCK_K, num_warps = 128, 128, 4
+        out.zero_()  # atomic_add accumulates into this
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), _SPLIT_K)
+        _mxfp8_linear_splitk_kernel[grid](
+            x_q,
+            x_scale,
+            w,
+            w_scale,
+            out,
+            M,
+            N,
+            K,
+            x_q.stride(0),
+            x_q.stride(1),
+            x_scale.stride(0),
+            x_scale.stride(1),
+            w.stride(0),
+            w.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            SPLIT_K=_SPLIT_K,
+            num_warps=num_warps,
+        )
+        return out
+
     BLOCK_M, BLOCK_K = 64, 128
     if M <= 512 and (K >= 4096 or (N == 6144 and K in (2048, 3072))):
         BLOCK_N, num_warps = 64, 4

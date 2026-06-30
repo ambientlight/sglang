@@ -197,8 +197,13 @@ def _match_fused_layer(
                         "model.layers.0.self_attn.k_proj",
                         "model.layers.0.self_attn.v_proj"]
     """
-    # find layer_name in mapping
-    fused = next((key for key in fused_mapping if layer_name.endswith(key)), None)
+    # find layer_name in mapping. Pick the LONGEST matching key (most specific):
+    # a suffix collision like ``index_qkv_proj`` also ``.endswith("qkv_proj")``,
+    # and ``next()`` would wrongly pick the shorter ``qkv_proj`` (whose component
+    # list includes a value projection the lightning-indexer does not have),
+    # making ``all()`` fail. Longest-suffix wins resolves it order-independently.
+    matching_keys = [key for key in fused_mapping if layer_name.endswith(key)]
+    fused = max(matching_keys, key=len) if matching_keys else None
     if fused is None:
         return None
 

@@ -462,6 +462,35 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_mxfp4_weight_only(self, weight_quant, input_quant):
+        """MiniMax-M3 routed experts: MXFP4 weight-only, E8M0 group-32, no input
+        quant in the checkpoint (W4A4 is self-scaled at runtime). Distinct from
+        NVFP4 (group-16 + input_activations present)."""
+        if weight_quant is None:
+            return False
+        return (
+            weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.group_size == 32
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and input_quant is None
+        )
+
+    def _is_mxfp8_weight_only(self, weight_quant, input_quant):
+        """MiniMax-M3 non-expert linears: MXFP8 weight-only (E4M3 + E8M0 group-32,
+        no input quant). The per-group format is `mxfp8-quantized`, but the model
+        config reports the GLOBAL format as `mixed-precision`, so we key on the
+        weight quant args (8-bit float, group-32) which uniquely identify it vs
+        the wNa16-int and per-tensor fp8 cases. Routed to the SM120 dot_scaled GEMM."""
+        if weight_quant is None or input_quant is not None:
+            return False
+        return (
+            weight_quant.num_bits == 8
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.group_size == 32
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+        )
+
     def _is_fp4a4_nvfp4(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ):
@@ -545,6 +574,18 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsLinearScheme:
+
+        # MiniMax-M3 MXFP8 linears (E4M3 + E8M0 group-32). Checked first because
+        # they also match _is_wNa16_group_channel (group + no-input) but their
+        # format is `mxfp8-quantized`, not `pack_quantized`, so that branch would
+        # raise. SM120 native via the Triton dot_scaled GEMM.
+        if self._is_mxfp8_weight_only(weight_quant, input_quant):
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW8A8Mxfp8,
+            )
+
+            logger.info_once("Using CompressedTensorsW8A8Mxfp8 (SM120 dot_scaled)")
+            return CompressedTensorsW8A8Mxfp8(strategy=weight_quant.strategy)
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
@@ -673,7 +714,32 @@ class CompressedTensorsConfig(QuantizationConfig):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
-        if self._is_wNa16_group_channel(weight_quant, input_quant):
+        if self._is_mxfp4_weight_only(weight_quant, input_quant):
+            # MiniMax-M3 native SM120 MXFP4 W4A4 (clamped SwiGLU-OAI). Checked
+            # BEFORE _is_wNa16_group_channel, which matches any group+no-input+
+            # static weight (it ignores num_bits/float-vs-int) and would otherwise
+            # swallow these float-4 experts into the slow Marlin path. Falls
+            # through to WNA16/Marlin if the SM120 kernel is absent or
+            # SGLANG_M3_FORCE_MARLIN=1.
+            import os as _os
+
+            from sglang.srt.layers.quantization.mxfp4_w4a4_moe import (
+                Mxfp4W4A4MoEScheme,
+                _flashinfer_has_native_mxfp4,
+            )
+
+            _force_marlin = _os.environ.get(
+                "SGLANG_M3_FORCE_MARLIN", ""
+            ).lower() in ("1", "true", "yes")
+            if not _force_marlin and _flashinfer_has_native_mxfp4():
+                logger.info_once("Using Mxfp4W4A4MoEScheme (native SM120 MXFP4)")
+                return Mxfp4W4A4MoEScheme(prefix=layer_name or "")
+            logger.info_once(
+                "Native SM120 MXFP4 unavailable/forced-off; "
+                "falling back to WNA16 (Marlin) for MXFP4 experts."
+            )
+            return CompressedTensorsWNA16MoE(self)
+        elif self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
                 if (
                     self._is_mxint4a16(weight_quant, input_quant)
@@ -821,6 +887,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return None
+
+        # MiniMax-M3 builds its MoE block under ``mlp.*`` (the model renames the
+        # checkpoint's ``block_sparse_moe`` -> ``mlp`` for its submodules), but the
+        # compressed-tensors config still targets the shared experts by their
+        # original ``block_sparse_moe.shared_experts.*`` name. Normalize so scheme
+        # lookup resolves. Routed experts (matched by ``.experts.\d+.``) and the
+        # dense ``mlp.{gate_up,down}_proj`` targets are unaffected.
+        if layer_name and ".mlp.shared_experts" in layer_name:
+            layer_name = layer_name.replace(
+                ".mlp.shared_experts", ".block_sparse_moe.shared_experts"
+            )
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:

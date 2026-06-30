@@ -64,6 +64,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     model.
     """
 
+    # Fused-module -> unfused checkpoint components, so a quant config that targets
+    # the unfused projections (e.g. compressed-tensors mxfp8) can resolve the fused
+    # GEMMs the model builds. The lightning-indexer fuses q+k only (no value when
+    # disable_index_value). Without this, scheme resolution for index_qkv_proj
+    # raises "Unable to find matching target".
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config,
@@ -283,9 +294,21 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         vit_qkv_weights: dict = {}
         vit_qkv_biases: dict = {}
 
+        # Load-completeness accounting for the routed experts. ``expert_loads``
+        # counts source tensors that actually reached a registered destination
+        # param; ``dropped_experts`` collects ones that matched an expert source
+        # name but resolved to NO destination (the silent-skip signature). See
+        # the post-load guard below.
+        load_stats = {"expert_loads": 0, "dropped_experts": []}
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # HF checkpoints may include a root model. prefix; normalize it
+            # before dispatch so text self_attn q/k/v does not enter VIT QKV merge.
+            if name.startswith("model."):
+                name = name[len("model.") :]
 
             if name.startswith("language_model."):
                 self._load_llm_weight(
@@ -294,6 +317,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                     params_dict,
                     llm_stacked_params_mapping,
                     expert_params_mapping,
+                    load_stats,
                 )
                 continue
 
@@ -307,6 +331,36 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         # attention layer (see MiniMaxM3.load_weights for the rationale).
         build_minimax_fused_qkv_index(self)
 
+        # ---- Load-completeness guard (Quest-5 root-cause bug class) ----
+        # The multi-day garble hunt ended at a SILENT expert-weight skip: the
+        # checkpoint's ``...experts.N.wX.weight_packed`` names produced
+        # destination params (``w13_weight_packed``) that matched nothing the
+        # bridge registered, so ``if new_name not in params_dict: continue``
+        # dropped EVERY routed-expert weight and the MoE ran on uninitialized
+        # ``torch.empty()`` memory -- fluent but prompt-independent, non-
+        # deterministic output. Every isolated kernel test was green because none
+        # exercised this production load path. Convert that silent failure into a
+        # loud one: a checkpoint that exposes expert tensors but lands none (or
+        # drops any) of them must NOT boot a server that serves garbage.
+        if num_experts > 0:
+            if load_stats["dropped_experts"]:
+                dropped = load_stats["dropped_experts"]
+                raise RuntimeError(
+                    f"[minimax_m3 load_weights] {len(dropped)} routed-expert weight(s) "
+                    f"matched an expert source name but resolved to NO registered "
+                    f"destination param -- they would be SILENTLY skipped, leaving the "
+                    f"MoE on uninitialized memory (fluent-but-random, prompt-independent "
+                    f"output). This is the weight_packed/weight_scale naming-contract bug. "
+                    f"Examples: {dropped[:6]}"
+                )
+            if load_stats["expert_loads"] == 0:
+                raise RuntimeError(
+                    f"[minimax_m3 load_weights] num_experts={num_experts} but ZERO "
+                    f"routed-expert weights were loaded -- the checkpoint exposed no "
+                    f"'experts.N.wX' tensors to this loader (prefix/naming mismatch). "
+                    f"The MoE would run on uninitialized memory; refusing to serve."
+                )
+
     def _load_llm_weight(
         self,
         name: str,
@@ -314,6 +368,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         params_dict: dict,
         llm_stacked_params_mapping: list,
         expert_params_mapping: list,
+        load_stats: dict = None,
     ) -> None:
         # Older checkpoints used the M2-style ``block_sparse_moe`` naming.
         if "block_sparse_moe" in name:
@@ -355,6 +410,25 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             param.weight_loader(param, loaded_weight, shard_id)
             return
 
+        # MXFP4 routed experts: the olka-fi checkpoint stores each expert
+        # projection as ``...experts.N.wX.weight_packed`` (E2M1 nibbles) and
+        # ``...experts.N.wX.weight_scale`` (E8M0 bytes). FusedMoE's
+        # make_expert_params_mapping targets the fused params ``experts.w13_*`` /
+        # ``experts.w2_*`` by appending the suffix that follows ``wX.`` — i.e.
+        # ``weight`` -> ``w13_weight`` and ``weight_scale_inv`` -> the scale param.
+        # Without this rename the produced names (``w13_weight_packed`` /
+        # ``w13_weight_scale``) match NO registered param, so every expert weight
+        # is SILENTLY skipped and the MoE runs on uninitialized memory (fluent but
+        # prompt-independent, non-deterministic output). Map the checkpoint
+        # suffixes onto the bridge's param names. Scoped to ``mlp.experts.`` so the
+        # MXFP8 linears (which legitimately use ``weight``/``weight_scale``) are
+        # untouched.
+        if "mlp.experts." in name:
+            if name.endswith(".weight_packed"):
+                name = name[: -len(".weight_packed")] + ".weight"
+            elif name.endswith(".weight_scale"):
+                name = name[: -len(".weight_scale")] + ".weight_scale_inv"
+
         is_expert_weight = False
         for mapping in expert_params_mapping:
             param_name, weight_name, expert_id, shard_id = mapping
@@ -372,8 +446,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
+            if load_stats is not None:
+                load_stats["expert_loads"] += 1
             return
         if is_expert_weight:
+            # Recognized as a routed-expert tensor by SOURCE name, but NO
+            # mapping produced a destination param that exists in params_dict.
+            # This is exactly the silent-skip that left the MoE uninitialized;
+            # record it so the post-load guard can refuse to serve.
+            if load_stats is not None:
+                load_stats["dropped_experts"].append(name)
             return
 
         if name.endswith(".bias") and name not in params_dict:
