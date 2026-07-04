@@ -48,6 +48,23 @@ class Mxfp4W4A4MoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        # Checkpoint MoE-scale encoding differs by model, and it MUST match how the
+        # HF loader copies the tensor into the scale Parameter (below):
+        #   * MiniMax-M3 (compressed-tensors, wrapped by Mxfp4W4A4MoEScheme with
+        #     fp8_method=None): scales are RAW UE8M0 bytes stored as uint8 — the
+        #     param must be uint8 so copy_ is byte-verbatim.
+        #   * DeepSeek-V4-Flash (this method used directly, real fp8_method):
+        #     scales are float8_e8m0fnu (F8_E8M0) — a float dtype. The param must
+        #     be float32 and process_weights re-encodes via _to_e8m0_u8; a uint8
+        #     param would NUMERIC-cast 2^-6=0.0156 -> 0, zeroing every sub-unit
+        #     scale and producing token-salad output.
+        # Discriminator: the M3 scheme constructs with fp8_method=None. Overridable
+        # via SGLANG_MXFP4_SCALE_RAW_U8={0,1} for checkpoints that break the rule.
+        _env = os.environ.get("SGLANG_MXFP4_SCALE_RAW_U8")
+        if _env is not None:
+            self.scale_raw_u8 = _env == "1"
+        else:
+            self.scale_raw_u8 = fp8_method is None
 
     def create_moe_runner(self, layer, moe_runner_config):
         # The fused launch runs in apply(); the runner only carries MoE config
@@ -92,26 +109,31 @@ class Mxfp4W4A4MoEMethod:
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # UE8M0 scales stored as raw uint8 bytes (e.g. 121 == 2^(121-127) == 2^-6),
-        # exactly what the kernel consumes after swizzle. Declare as uint8 so the
-        # HF loader copies the bytes verbatim — a float32 param would copy byte
-        # 121 as the VALUE 121.0 and _to_e8m0_u8 would then re-encode that as a
-        # magnitude, corrupting every scale (the cause of token-salad output).
+        # Scale param dtype MUST match the checkpoint encoding (see __init__):
+        #   * M3 raw-UE8M0 (scale_raw_u8=True): uint8, HF loader copies bytes
+        #     verbatim (byte 121 == 2^(121-127) == 2^-6), consumed after swizzle.
+        #   * DSV4 F8_E8M0 (scale_raw_u8=False): float32 placeholder — E8M0 are
+        #     exact powers of two so the HF loader casts the float8 scales
+        #     losslessly; process_weights_after_loading re-encodes via _to_e8m0_u8.
+        # Getting this wrong corrupts every scale (uint8 param + float ckpt casts
+        # 2^-6 -> 0 == token-salad; float param + raw-u8 ckpt reads bytes as values).
+        _scale_dtype = torch.uint8 if self.scale_raw_u8 else torch.float32
+        _scale_init = torch.zeros if self.scale_raw_u8 else torch.ones
         w13_weight_scale = Parameter(
-            torch.zeros(
+            _scale_init(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // _FP4_BLOCK_K,
-                dtype=torch.uint8,
+                dtype=_scale_dtype,
             ),
             requires_grad=False,
         )
         w2_weight_scale = Parameter(
-            torch.zeros(
+            _scale_init(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // _FP4_BLOCK_K,
-                dtype=torch.uint8,
+                dtype=_scale_dtype,
             ),
             requires_grad=False,
         )
@@ -171,12 +193,21 @@ class Mxfp4W4A4MoEMethod:
                 [w13_s[:, Irows:, :], w13_s[:, :Irows, :]], dim=1
             ).contiguous()
 
-        # Scales are already raw UE8M0 bytes (uint8) from the checkpoint — feed
-        # them straight into the swizzle (NO float re-encode, which would corrupt
-        # the exponent bytes). The [w3,w1] reorder above is a byte-wise gather, so
-        # it preserves the encoding.
-        w13_s_u8 = w13_s.to(torch.uint8).contiguous()
-        w2_s_u8 = w2_s.to(torch.uint8).contiguous()
+        # Convert the loaded scales to raw UE8M0 bytes for the swizzle. The [w3,w1]
+        # reorder above is a byte-/element-wise gather, so it preserves either
+        # encoding. Which conversion is correct depends on the checkpoint dtype
+        # (see __init__ scale_raw_u8):
+        #   * M3 (scale_raw_u8=True): the param already holds raw UE8M0 bytes —
+        #     take them verbatim (a float re-encode would corrupt them).
+        #   * DSV4 (scale_raw_u8=False): the param holds float8_e8m0fnu magnitudes
+        #     loaded into float32 — re-encode to E8M0 bytes via _to_e8m0_u8 (a
+        #     verbatim uint8 view would read the float mantissa as a byte value).
+        if self.scale_raw_u8:
+            w13_s_u8 = w13_s.to(torch.uint8).contiguous()
+            w2_s_u8 = w2_s.to(torch.uint8).contiguous()
+        else:
+            w13_s_u8 = self._to_e8m0_u8(w13_s.to(torch.float32))
+            w2_s_u8 = self._to_e8m0_u8(w2_s.to(torch.float32))
 
         # 128x4 block-scale swizzle (per expert), then convert to the MMA layout
         # the fused kernel reads (experts flattened into the leading row dim).
