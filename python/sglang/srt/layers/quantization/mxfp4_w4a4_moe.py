@@ -315,12 +315,19 @@ class Mxfp4W4A4MoEMethod:
         # MXFP4 self-scales: no activation global scale (GEMM alpha = 1).
         ones = layer._w4a4_alpha
 
-        # M3 clamped SwiGLU-OAI: pull (alpha, limit, beta) from the runner config.
-        # Defaults match M3 (alpha=1.702, limit=7.0, beta=1.0). When the config
-        # carries no clamp (limit None) fall back to plain "silu".
+        # Activation selection. M3 uses the clamped SwiGLU-OAI epilogue
+        # (g=fmin(g,L); u=clamp(u,±L); g·sigmoid(alpha·g)·(u+beta)); DeepSeek-V4-Flash
+        # uses plain SiLU on the flashinfer SM120 MoE path (its checkpoint's
+        # `swiglu_limit` maps to gemm1_clamp_limit but is a DIFFERENT op — a
+        # pre-activation clamp for the deep_gemm/triton backends — and is NOT applied
+        # by this fused kernel, matching the proven `activation="silu"` recipe).
+        # So key the epilogue on the model, not on gemm1_clamp_limit alone: only the
+        # M3 path (scale_raw_u8, i.e. the compressed-tensors Scheme with fp8_method=
+        # None) may select swigluoai. Selecting swigluoai for DSV4 runs the wrong
+        # activation (α/β SwiGLU-OAI vs SiLU) and corrupts every MoE output.
         _limit = getattr(cfg, "gemm1_clamp_limit", None) if cfg else None
         _alpha = getattr(cfg, "gemm1_alpha", None) if cfg else None
-        if _limit is not None:
+        if self.scale_raw_u8 and _limit is not None:
             act = "swigluoai"
             sw_alpha = float(_alpha) if _alpha is not None else 1.702
             sw_limit = float(_limit)
