@@ -444,10 +444,19 @@ class Mxfp4W4A4MoEMethod:
                     layer._w4a4_static_ws,
                 )
 
-        # NOTE: M3 applies routed_scaling_factor (2.0) inside TopK
-        # (apply_routed_scaling_factor_on_output=True -> topk_weights *= rsf), so it
-        # is ALREADY baked into topk_weights the kernel combined. Do NOT re-multiply
-        # here (the DSV4 template did; for M3 that would double-apply the 2x).
+        # routed_scaling_factor: DSV4-Flash (scale_raw_u8=False) does NOT bake it into
+        # topk_weights, so its MoE output must be scaled here (DSV4 config has 1.5) —
+        # dropping it left every DSV4 MoE layer 1/rsf too small, drifting the model into
+        # runaway generation. M3 (scale_raw_u8=True) already applies rsf inside TopK
+        # (apply_routed_scaling_factor_on_output=True -> topk_weights *= rsf), so it is
+        # baked into the combined output; re-multiplying would double-apply it. Gate on
+        # the model discriminator so each path scales exactly once.
+        if not self.scale_raw_u8:
+            routed_scaling_factor = (
+                getattr(cfg, "routed_scaling_factor", None) if cfg else None
+            )
+            if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+                output = output * routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
 
 
