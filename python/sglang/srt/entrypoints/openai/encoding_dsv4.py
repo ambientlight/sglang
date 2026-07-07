@@ -149,10 +149,24 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call.get("arguments")
+
+    # `arguments` is normally a JSON string (OpenAI format) that decodes to a dict of
+    # params, but clients vary: it may already be a dict, be empty/None (zero-arg tool
+    # such as ExitPlanMode), or be a JSON string that decodes to a non-dict (str, list,
+    # number). Normalize every shape to a dict of param->value; anything that is not a
+    # param mapping is wrapped under a single "arguments" key rather than crashing on
+    # `.items()` (which raised AttributeError: 'str' object has no attribute 'items').
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    elif raw_arguments is None or raw_arguments == "":
+        arguments = {}
+    else:
+        try:
+            parsed = json.loads(raw_arguments)
+        except Exception:
+            parsed = raw_arguments
+        arguments = parsed if isinstance(parsed, dict) else {"arguments": parsed}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
