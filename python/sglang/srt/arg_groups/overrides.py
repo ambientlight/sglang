@@ -1900,7 +1900,9 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
 def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     """Slot pass in the DeepSeek V4 hook: default the kv-cache dtype to FP8
     (bfloat16 on NPU, where the pool geometry differs) and validate the
-    result. The NPU split-backend writes stay in the hook."""
+    result. NVIDIA CUDA uses the packed FP8-nope/BF16-rope pool and does not
+    currently have a bfloat16 alternative. The NPU split-backend writes stay
+    in the hook."""
     hf_config = view.get_model_config().hf_config
     model_arch = hf_config.architectures[0]
     if model_arch != "DeepseekV4ForCausalLM":
@@ -1912,10 +1914,15 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
         logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
     if view.device == "npu":
         kv_cache_dtype = "bfloat16"
-    assert kv_cache_dtype in [
-        "fp8_e4m3",
-        "bfloat16",
-    ], f"{kv_cache_dtype} is not supported for {model_arch}"
+    elif (
+        kv_cache_dtype == "bfloat16" and view.device == "cuda" and not is_hip()
+    ):
+        raise ValueError(
+            f"{kv_cache_dtype} is not supported for {model_arch} on "
+            "NVIDIA CUDA; the packed DSV4 pool requires fp8_e4m3"
+        )
+    elif kv_cache_dtype not in ("fp8_e4m3", "bfloat16"):
+        raise ValueError(f"{kv_cache_dtype} is not supported for {model_arch}")
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}

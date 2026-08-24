@@ -1486,11 +1486,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _deepseek_v4_kv_cache_dtype(_view(device="npu")),
             {"kv_cache_dtype": "bfloat16"},
         )
-        # explicit supported value survives
+        # NVIDIA CUDA has no bfloat16 storage/kernel path. Keep ROCm's
+        # platform-specific path out of this NVIDIA validation.
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_hip", return_value=False
+        ), self.assertRaisesRegex(ValueError, "requires fp8_e4m3"):
+            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16"))
+        with patch("sglang.srt.arg_groups.overrides.is_hip", return_value=True):
+            self.assertEqual(
+                _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
+            )
+        # NPU's distinct pool supports and preserves explicit bfloat16.
         self.assertEqual(
-            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
+            _deepseek_v4_kv_cache_dtype(
+                _view(device="npu", kv_cache_dtype="bfloat16")
+            ),
+            {},
         )
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))
         self.assertEqual(
             _deepseek_v4_kv_cache_dtype(_view(arch="LlamaForCausalLM")), {}
