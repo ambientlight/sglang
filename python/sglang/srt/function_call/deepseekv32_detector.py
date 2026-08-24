@@ -8,6 +8,7 @@ from partial_json_parser.core.options import Allow
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
+    MalformedToolCallError,
     StreamingParseResult,
     StructureInfo,
     ToolCallItem,
@@ -16,6 +17,28 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
+
+_GENERIC_INVOKE_RE = re.compile(
+    r'^[ \t]*<invoke\s+name="(?P<name>[^"]+)"\s*>', re.MULTILINE
+)
+
+
+def find_malformed_generic_tool_call(
+    text: str, tools: list[Tool]
+) -> tuple[str, int] | None:
+    """Find a line-anchored generic invocation of a declared tool.
+
+    DeepSeek V3.2/V4 must emit ``<｜DSML｜invoke ...>``. A generic
+    ``<invoke ...>`` is therefore model-generated protocol drift, but only
+    classify it when the name belongs to this request so ordinary inline XML
+    examples remain content.
+    """
+    tool_names = {tool.function.name for tool in tools if tool.function.name}
+    for match in _GENERIC_INVOKE_RE.finditer(text):
+        name = match.group("name").strip()
+        if name in tool_names:
+            return name, match.start()
+    return None
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -81,6 +104,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         "</｜DSML｜tool_calls",
         "</｜DSML｜function_calls",
     ]
+    _GENERIC_INVOKE_PREFIX = "<invoke"
 
     def __init__(self):
         super().__init__()
@@ -108,7 +132,37 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text or "<｜DSML｜invoke" in text
+        return (
+            self.bot_token in text
+            or "<｜DSML｜invoke" in text
+            or _GENERIC_INVOKE_RE.search(text) is not None
+        )
+
+    @classmethod
+    def _ends_with_partial_generic_invoke(cls, text: str) -> bool:
+        """Hold a line-start generic invoke until it can be classified."""
+        tail = text.rsplit("\n", 1)[-1].lstrip(" \t")
+        if not tail:
+            return False
+        if cls._GENERIC_INVOKE_PREFIX.startswith(tail):
+            return True
+        return tail.startswith(cls._GENERIC_INVOKE_PREFIX) and ">" not in tail
+
+    @staticmethod
+    def _reject_malformed_generic_tool_call(text: str, tools: list[Tool]) -> None:
+        malformed = find_malformed_generic_tool_call(text, tools)
+        if malformed is None:
+            return
+        name, offset = malformed
+        logger.warning(
+            "DeepSeek output used malformed generic invocation for declared "
+            "tool %r at character %d",
+            name,
+            offset,
+        )
+        raise MalformedToolCallError(
+            "Model emitted malformed DeepSeek tool-call protocol"
+        )
 
     @classmethod
     def _ends_with_partial_tool_tag(cls, text: str) -> bool:
@@ -221,6 +275,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        self._reject_malformed_generic_tool_call(text, tools)
         idx = text.find(self.bot_token)
         normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
         if self.bot_token not in text:
@@ -263,6 +318,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+        self._reject_malformed_generic_tool_call(current_text, tools)
 
         # Check if buffer contains any DSML tool-call markers or ends with a
         # partial tag prefix.  Use specific tool-call tags instead of bare
@@ -274,7 +330,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Find the last "<" in the text; everything from there to the end is a
         # candidate partial tag.  If any complete tag starts with this tail,
         # we buffer and wait for more data.
-        ends_with_prefix = self._ends_with_partial_tool_tag(current_text)
+        ends_with_prefix = self._ends_with_partial_tool_tag(
+            current_text
+        ) or self._ends_with_partial_generic_invoke(current_text)
 
         if (
             not self.has_tool_call(current_text)
@@ -422,6 +480,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 postamble
                 and not any(tag in postamble for tag in self._DSML_TOOL_TAGS)
                 and not self._ends_with_partial_tool_tag(postamble)
+                and not self._ends_with_partial_generic_invoke(postamble)
             ):
                 normal_text_parts.append(postamble)
                 self._buffer = ""

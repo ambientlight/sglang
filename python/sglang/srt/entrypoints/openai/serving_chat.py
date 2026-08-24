@@ -77,7 +77,10 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import MalformedToolCallError, ToolCallItem
+from sglang.srt.function_call.deepseekv32_detector import (
+    find_malformed_generic_tool_call,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
@@ -839,6 +842,32 @@ class OpenAIServingChat(OpenAIServingBase):
             return media_error
 
         effective_tools = self._effective_tools(request)
+        if (
+            self.tool_call_parser in ("deepseekv32", "deepseekv4")
+            and effective_tools
+            and request.tool_choice != "none"
+        ):
+            for index, message in enumerate(request.messages):
+                if getattr(message, "role", None) != "assistant":
+                    continue
+                content = getattr(message, "content", None)
+                text_parts = [content] if isinstance(content, str) else []
+                if isinstance(content, list):
+                    text_parts.extend(
+                        part.text
+                        for part in content
+                        if getattr(part, "type", None) == "text"
+                        and isinstance(getattr(part, "text", None), str)
+                    )
+                for text in text_parts:
+                    malformed = find_malformed_generic_tool_call(text, effective_tools)
+                    if malformed is not None:
+                        name, _ = malformed
+                        return (
+                            f"Assistant message {index} contains malformed DeepSeek "
+                            f"tool-call markup for declared tool {name!r}; replay it "
+                            "as a structured tool call or remove it."
+                        )
         has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
             and message.role in ("system", "developer")
@@ -1495,6 +1524,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except MalformedToolCallError as e:
+            return self.create_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -1767,6 +1800,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        except MalformedToolCallError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
+            yield f"data: {error}\n\n"
         except ValueError as e:
             if not stream_started:
                 raise
@@ -1894,13 +1934,23 @@ class OpenAIServingChat(OpenAIServingBase):
             effective_tools = self._effective_tools(request)
             if self._tool_call_parsing_active(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    effective_tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+                try:
+                    tool_calls, text, finish_reason = self._process_tool_calls(
+                        text,
+                        effective_tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
+                except MalformedToolCallError:
+                    logger.warning(
+                        "Rejecting completion with malformed DeepSeek tool-call protocol"
+                    )
+                    return self.create_error_response(
+                        "Model emitted malformed DeepSeek tool-call protocol",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -2107,6 +2157,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except MalformedToolCallError:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)

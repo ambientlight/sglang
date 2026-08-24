@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.function_call.core_types import MalformedToolCallError
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.template_detection import detect_inline_system_support
 
@@ -1017,6 +1018,11 @@ class AnthropicServing:
                 break
             except asyncio.CancelledError:
                 raise
+            except MalformedToolCallError as e:
+                logger.warning("Malformed DeepSeek tool-call output: %s", e)
+                for frame in _flush_on_error("api_error", str(e)):
+                    yield frame
+                return
             except ValueError as e:
                 # _generate_chat_stream re-raises ValueError when its own
                 # ``stream_started`` flag is still False — surface as a

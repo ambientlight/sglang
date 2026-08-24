@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.function_call.core_types import MalformedToolCallError  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -43,6 +44,8 @@ class _FakeOpenAIServingChat:
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
             for line in self.stream_lines:
+                if isinstance(line, BaseException):
+                    raise line
                 yield line
 
         return _gen()
@@ -638,6 +641,21 @@ class TestAnthropicServing(unittest.TestCase):
         error_event = events[1]
         self.assertEqual(error_event["error"]["type"], "api_error")
         self.assertIn("no content", error_event["error"]["message"].lower())
+
+    def test_stream_malformed_tool_protocol_emits_api_error(self):
+        serving = self._serving(
+            [MalformedToolCallError("Model emitted malformed tool protocol")]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertEqual(events[1]["error"]["type"], "api_error")
 
     def test_cache_read_exceeds_prompt_tokens_clamps_to_zero(self):
         """When cached_tokens > prompt_tokens, input_tokens clamps to 0 instead of going negative."""

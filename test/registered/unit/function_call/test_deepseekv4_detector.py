@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.core_types import MalformedToolCallError
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +29,20 @@ def _param(name: str, is_string: str, value: str) -> str:
 
 def _weather_call(city: str = "SF") -> str:
     return _wrapped(_invoke("get_weather", _param("city", "true", city)))
+
+
+def _generic_weather_call(*, mixed: bool = False) -> str:
+    if mixed:
+        return (
+            '<invoke name="get_weather">\n'
+            f'{_param("city", "true", "SF")}\n'
+            f'</{DSML}invoke>\n</{DSML}tool_calls>'
+        )
+    return (
+        '<invoke name="get_weather">\n'
+        '<parameter name="city" string="true">SF</parameter>\n'
+        "</invoke>"
+    )
 
 
 class TestDeepSeekV4Streaming(CustomTestCase):
@@ -144,6 +159,34 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         # The tool call is emitted as a call, NOT as normal_text
         self.assertNotIn("get_weather", second.normal_text)
         self.assertTrue(any(c.name == "get_weather" for c in second.calls))
+
+    def test_capture_derived_generic_and_mixed_calls_fail_closed(self):
+        """Captured generic openings are protocol drift, not normal text."""
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed), self.assertRaises(
+                MalformedToolCallError
+            ):
+                DeepSeekV4Detector().detect_and_parse(
+                    _generic_weather_call(mixed=mixed), self.tools
+                )
+
+    def test_capture_derived_generic_call_is_held_across_stream_chunks(self):
+        detector = DeepSeekV4Detector()
+        first = detector.parse_streaming_increment("<in", self.tools)
+
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(first.calls, [])
+        with self.assertRaises(MalformedToolCallError):
+            detector.parse_streaming_increment(
+                'voke name="get_weather">\n<parameter name="city"', self.tools
+            )
+
+    def test_inline_generic_xml_example_remains_normal_text(self):
+        text = 'The literal `<invoke name="get_weather">` is invalid.'
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
 
 
 if __name__ == "__main__":

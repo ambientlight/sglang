@@ -284,6 +284,96 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
+    def test_dsv4_rejects_malformed_declared_tool_in_assistant_history(self):
+        self.chat.tool_call_parser = "deepseekv4"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        '<invoke name="get_weather">\n'
+                        '<parameter name="city">SF</parameter>\n'
+                        "</invoke>"
+                    ),
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+            tools=[tool],
+        )
+
+        error = self.chat._validate_request(request)
+
+        self.assertIn("Assistant message 1", error)
+        self.assertIn("structured tool call", error)
+
+    def test_dsv4_history_quarantine_is_scoped_to_declared_tools(self):
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": '<invoke name="example_only">\n</invoke>',
+                }
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_dsv4_non_streaming_malformed_output_returns_server_error(self):
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        ret = [
+            {
+                "text": '<invoke name="get_weather">\n</invoke>',
+                "meta_info": {
+                    "id": "chatcmpl-malformed-tool",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(request, ret, created=0)
+        body = json.loads(response.body)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(body["type"], "InternalServerError")
+        self.assertNotIn("<invoke", body["message"])
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (

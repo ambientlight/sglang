@@ -4,6 +4,10 @@ from typing import Callable, List, Optional
 from pydantic import BaseModel
 
 
+class MalformedToolCallError(ValueError):
+    """Model output used tool-like syntax that the configured parser cannot trust."""
+
+
 class ToolCallItem(BaseModel):
     """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
 
