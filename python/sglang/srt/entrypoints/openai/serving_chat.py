@@ -759,15 +759,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 if chunk:
                     yield chunk
 
-            # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
-                parser = parser_dict[index]
-                remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
-                )
-                if remaining_chunk:
-                    yield remaining_chunk
-
         else:
             # Regular content
             if delta:
@@ -2584,37 +2575,40 @@ class OpenAIServingChat(OpenAIServingBase):
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
-        # Yield normal text
+        calls = list(calls)
+        remaining_chunk = None
+        if flush:
+            remaining_chunk = self._check_for_unstreamed_tool_args(
+                parser, content, request, index
+            )
+
+        # A detector can finish an active invoke and expose its postamble in
+        # the same parse increment.  Continuation-only call items belong to
+        # the already-open tool call and therefore must precede that text.
+        # A named call starts a new tool, so text before it remains a preamble
+        # (or inter-call text) and is emitted first.  This distinction is
+        # required by Anthropic streams, where opening a text block closes the
+        # current tool_use block permanently.
+        leading_continuations = 0
         if normal_text:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(content=normal_text),
-                finish_reason=None,
+            while (
+                leading_continuations < len(calls)
+                and calls[leading_continuations].name is None
+            ):
+                leading_continuations += 1
+
+        remaining_before_text = bool(
+            remaining_chunk
+            and normal_text
+            and (
+                leading_continuations
+                or (not calls and has_tool_calls.get(index, False))
             )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[choice_data],
-                model=request.model,
-            )
+        )
 
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                )
-
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-        # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-        for call_item in calls:
+
+        def build_tool_call_chunk(call_item: ToolCallItem) -> str:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
@@ -2651,6 +2645,40 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
+            if continuous_usage_stats:
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                )
+
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        for call_item in calls[:leading_continuations]:
+            yield build_tool_call_chunk(call_item)
+
+        if remaining_before_text:
+            yield remaining_chunk
+
+        # Yield normal text after continuations for the active tool, but before
+        # any named call that starts a new tool.
+        if normal_text:
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(content=normal_text),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
                 prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
@@ -2664,6 +2692,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+        for call_item in calls[leading_continuations:]:
+            yield build_tool_call_chunk(call_item)
+
+        if remaining_chunk and not remaining_before_text:
+            yield remaining_chunk
 
     def _check_for_unstreamed_tool_args(
         self,

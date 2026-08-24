@@ -273,6 +273,59 @@ class TestAnthropicServing(unittest.TestCase):
         ][0]
         self.assertEqual(text_delta["index"], 1)
 
+    def test_stream_late_tool_argument_fails_closed(self):
+        """Never turn an impossible argument continuation into malformed success."""
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "\n"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ': "sglang"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        errors = [event for event in events if event["type"] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"]["type"], "api_error")
+        self.assertNotIn("message_delta", [event["type"] for event in events])
+        self.assertEqual(events[-1]["type"], "message_stop")
+
     def test_stream_reasoning_content_uses_thinking_block(self):
         serving = self._serving(
             [

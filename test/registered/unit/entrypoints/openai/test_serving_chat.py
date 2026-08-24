@@ -1995,6 +1995,128 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
+    def test_tool_call_continuation_precedes_postamble_content(self):
+        """A closing invoke must finish its JSON before postamble text is sent.
+
+        DeepSeek's detector can return both the final argument fragment and the
+        text following ``</invoke>`` from one parse increment.  Anthropic closes
+        a ``tool_use`` block as soon as it sees text, so emitting that text first
+        makes the following argument fragment impossible to attach.
+        """
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Check status"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        parser_dict = {}
+        has_tool_calls = {}
+        emitted = []
+
+        async def collect(delta):
+            async for line in self.chat._process_tool_call_stream(
+                index=0,
+                delta=delta,
+                parser_dict=parser_dict,
+                content={"meta_info": {"id": "chatcmpl-ordering"}},
+                request=request,
+                has_tool_calls=has_tool_calls,
+            ):
+                emitted.append(json.loads(line[len("data: ") :]))
+
+        first = (
+            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n'
+            '<｜DSML｜parameter name="command" string="true">git status'
+            '</｜DSML｜parameter>\n<｜DSML｜parameter name="description" '
+            'string="true">Show commits ahead of'
+        )
+        second = " main</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+        loop = get_or_create_event_loop()
+        loop.run_until_complete(collect(first))
+        before_second = len(emitted)
+        loop.run_until_complete(collect(second))
+
+        second_deltas = [
+            chunk["choices"][0]["delta"] for chunk in emitted[before_second:]
+        ]
+        final_arg_index = next(
+            i
+            for i, delta in enumerate(second_deltas)
+            if delta.get("tool_calls")
+            and delta["tool_calls"][0]["function"].get("arguments")
+        )
+        postamble_index = next(
+            i for i, delta in enumerate(second_deltas) if delta.get("content")
+        )
+        self.assertLess(final_arg_index, postamble_index)
+
+        arguments = "".join(
+            tool_call["function"].get("arguments") or ""
+            for chunk in emitted
+            for tool_call in chunk["choices"][0]["delta"].get("tool_calls") or []
+        )
+        self.assertEqual(
+            json.loads(arguments),
+            {"command": "git status", "description": "Show commits ahead of main"},
+        )
+
+    def test_terminal_tool_argument_flush_precedes_postamble_content(self):
+        """The finish-time safety flush obeys the same tool-before-text order."""
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Lookup"}],
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+            stream=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as parser_cls:
+            parser = parser_cls.return_value
+            parser.parse_stream_chunk.return_value = ("\n", [])
+            parser.parse_stream_end.return_value = ("", [])
+            parser.detector.prev_tool_call_arr = [
+                {"name": "lookup", "arguments": '{"query": "sglang"}'}
+            ]
+            parser.detector.streamed_args_for_tool = ['{"query"']
+            emitted = []
+
+            async def collect():
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta="",
+                    parser_dict={0: parser},
+                    content={"meta_info": {"id": "chatcmpl-terminal-ordering"}},
+                    request=request,
+                    has_tool_calls={0: True},
+                    flush=True,
+                ):
+                    emitted.append(json.loads(line[len("data: ") :]))
+
+            get_or_create_event_loop().run_until_complete(collect())
+
+        deltas = [chunk["choices"][0]["delta"] for chunk in emitted]
+        self.assertEqual(
+            deltas[0]["tool_calls"][0]["function"]["arguments"], ': "sglang"}'
+        )
+        self.assertEqual(deltas[1]["content"], "\n")
+
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
         from sglang.srt.parser.template_manager import TemplateManager

@@ -1389,11 +1389,14 @@ class AnthropicServing:
                         # Continuing arguments for current tool call
                         if content_block_type != "tool_use":
                             logger.warning(
-                                "Dropping tool_call argument delta with no "
-                                "open tool_use block: %r",
-                                (tc_func.arguments or "")[:100],
+                                "Tool-call argument delta arrived with no open "
+                                "tool_use block; failing the Anthropic stream closed"
                             )
-                            continue
+                            for frame in _flush_on_error(
+                                "api_error", "Invalid tool-call stream ordering"
+                            ):
+                                yield frame
+                            return
                         yield _emit(
                             ContentBlockDeltaEvent(
                                 index=content_block_index,
