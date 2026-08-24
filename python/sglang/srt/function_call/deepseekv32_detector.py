@@ -347,6 +347,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         all_calls: list[ToolCallItem] = []
         normal_text_parts: list[str] = []
+        ordered_items: list[str | ToolCallItem] = []
+
+        def append_normal_text(text: str) -> None:
+            if not text:
+                return
+            normal_text_parts.append(text)
+            ordered_items.append(text)
+
+        def append_call(call: ToolCallItem) -> None:
+            all_calls.append(call)
+            ordered_items.append(call)
 
         def normal_prefix(end: int) -> str:
             """Return ordinary text before an invoke, excluding DSML wrappers."""
@@ -389,9 +400,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     if bot_pos != -1:
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
-                    normal_text_parts.append(normal_prefix(call_start))
+                    append_normal_text(normal_prefix(call_start))
                 else:
-                    normal_text_parts.append(normal_prefix(invoke_match.start()))
+                    append_normal_text(normal_prefix(invoke_match.start()))
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -401,7 +412,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 # 1. Send tool name if not sent yet
                 if not self.current_tool_name_sent:
-                    all_calls.append(
+                    append_call(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
                             name=func_name,
@@ -434,7 +445,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             argument_diff = prefix[sent_len:]
 
                 if argument_diff:
-                    all_calls.append(
+                    append_call(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
                             name=None,
@@ -482,11 +493,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 and not self._ends_with_partial_tool_tag(postamble)
                 and not self._ends_with_partial_generic_invoke(postamble)
             ):
-                normal_text_parts.append(postamble)
+                append_normal_text(postamble)
                 self._buffer = ""
 
             return StreamingParseResult(
-                normal_text="".join(normal_text_parts), calls=all_calls
+                normal_text="".join(normal_text_parts),
+                calls=all_calls,
+                ordered_items=ordered_items,
             )
 
         except Exception as e:
@@ -498,7 +511,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self.current_tool_name_sent = False
             self.prev_tool_call_arr = []
             self.streamed_args_for_tool = [""]
-            return StreamingParseResult(normal_text="".join(normal_text_parts))
+            normal_text = "".join(normal_text_parts)
+            return StreamingParseResult(
+                normal_text=normal_text,
+                ordered_items=[normal_text] if normal_text else [],
+            )
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         """Flush any text trapped in the buffer when the stream ends.

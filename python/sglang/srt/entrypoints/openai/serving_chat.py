@@ -78,9 +78,6 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import MalformedToolCallError, ToolCallItem
-from sglang.srt.function_call.deepseekv32_detector import (
-    find_malformed_generic_tool_call,
-)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
@@ -833,32 +830,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return media_error
 
         effective_tools = self._effective_tools(request)
-        if (
-            self.tool_call_parser in ("deepseekv32", "deepseekv4")
-            and effective_tools
-            and request.tool_choice != "none"
-        ):
-            for index, message in enumerate(request.messages):
-                if getattr(message, "role", None) != "assistant":
-                    continue
-                content = getattr(message, "content", None)
-                text_parts = [content] if isinstance(content, str) else []
-                if isinstance(content, list):
-                    text_parts.extend(
-                        part.text
-                        for part in content
-                        if getattr(part, "type", None) == "text"
-                        and isinstance(getattr(part, "text", None), str)
-                    )
-                for text in text_parts:
-                    malformed = find_malformed_generic_tool_call(text, effective_tools)
-                    if malformed is not None:
-                        name, _ = malformed
-                        return (
-                            f"Assistant message {index} contains malformed DeepSeek "
-                            f"tool-call markup for declared tool {name!r}; replay it "
-                            "as a structured tool call or remove it."
-                        )
         has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
             and message.role in ("system", "developer")
@@ -2567,13 +2538,36 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
         else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
-            if flush:
-                end_text, end_calls = parser.parse_stream_end()
-                normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+            result = parser.parse_stream_chunk_result(delta)
+
+        normal_text, calls = result.normal_text, result.calls
+        ordered_items = result.ordered_items
+        if flush and not isinstance(parser, JsonArrayParser):
+            end_result = parser.parse_stream_end_result()
+            end_text, end_calls = end_result.normal_text, end_result.calls
+            end_ordered_items = end_result.ordered_items
+
+            if ordered_items is not None:
+                ordered_items = list(ordered_items)
+                if end_ordered_items is not None:
+                    ordered_items.extend(end_ordered_items)
+                else:
+                    # ``finish`` is terminal and its normal text follows
+                    # everything returned by the incremental parse.
+                    ordered_items.extend(end_calls)
+                    if end_text:
+                        ordered_items.append(end_text)
+            elif end_ordered_items is not None:
+                # Preserve an ordinary incremental prefix before a detector
+                # that only supplies ordering metadata from ``finish``.
+                ordered_items = []
+                if normal_text:
+                    ordered_items.append(normal_text)
+                ordered_items.extend(calls)
+                ordered_items.extend(end_ordered_items)
+            normal_text = (normal_text or "") + end_text
+            calls = list(calls) + end_calls
 
         calls = list(calls)
         remaining_chunk = None
@@ -2658,18 +2652,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             return f"data: {chunk.model_dump_json()}\n\n"
 
-        for call_item in calls[:leading_continuations]:
-            yield build_tool_call_chunk(call_item)
-
-        if remaining_before_text:
-            yield remaining_chunk
-
-        # Yield normal text after continuations for the active tool, but before
-        # any named call that starts a new tool.
-        if normal_text:
+        def build_text_chunk(text: str) -> str:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(content=normal_text),
+                delta=DeltaMessage(content=text),
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -2679,7 +2665,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
                 prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
@@ -2691,7 +2676,46 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        if ordered_items is not None:
+            # ``remaining_chunk`` is the terminal argument suffix for the last
+            # active tool. Keep it after that tool's parsed deltas and before
+            # any following text block.
+            remaining_after = None
+            for item_index, item in enumerate(ordered_items):
+                if isinstance(item, ToolCallItem):
+                    remaining_after = item_index
+
+            if remaining_chunk and remaining_after is None:
+                # No call item in this increment means the suffix belongs to a
+                # tool opened by an earlier increment.
+                remaining_after = -1
+
+            if remaining_chunk and remaining_after == -1:
+                yield remaining_chunk
+
+            for item_index, item in enumerate(ordered_items):
+                if isinstance(item, str):
+                    if item:
+                        yield build_text_chunk(item)
+                else:
+                    yield build_tool_call_chunk(item)
+                if remaining_chunk and item_index == remaining_after:
+                    yield remaining_chunk
+
+            return
+
+        for call_item in calls[:leading_continuations]:
+            yield build_tool_call_chunk(call_item)
+
+        if remaining_before_text:
+            yield remaining_chunk
+
+        # Yield normal text after continuations for the active tool, but before
+        # any named call that starts a new tool.
+        if normal_text:
+            yield build_text_chunk(normal_text)
 
         for call_item in calls[leading_continuations:]:
             yield build_tool_call_chunk(call_item)

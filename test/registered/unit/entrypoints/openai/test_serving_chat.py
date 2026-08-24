@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -284,7 +285,13 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
-    def test_dsv4_rejects_malformed_declared_tool_in_assistant_history(self):
+    def test_dsv4_accepts_literal_invoke_text_in_assistant_history(self):
+        """Historical assistant content is request data, not generated output.
+
+        The OpenAI and Anthropic APIs both permit assistant-prefill text.  A
+        literal protocol example must not be reinterpreted as a live tool call
+        merely because its name matches a currently declared tool.
+        """
         self.chat.tool_call_parser = "deepseekv4"
         tool = {
             "type": "function",
@@ -310,12 +317,9 @@ class ServingChatTestCase(unittest.TestCase):
             tools=[tool],
         )
 
-        error = self.chat._validate_request(request)
+        self.assertIsNone(self.chat._validate_request(request))
 
-        self.assertIn("Assistant message 1", error)
-        self.assertIn("structured tool call", error)
-
-    def test_dsv4_history_quarantine_is_scoped_to_declared_tools(self):
+    def test_dsv4_accepts_undeclared_literal_invoke_text_in_history(self):
         self.chat.tool_call_parser = "deepseekv4"
         request = ChatCompletionRequest(
             model="x",
@@ -1959,15 +1963,14 @@ class ServingChatTestCase(unittest.TestCase):
             parser_instance = ParserMock.return_value
 
             # First call returns one ToolCallItem-like chunk (with name)
-            first_chunk_call = Mock()
-            # Kimi-K2 series models might generate fixed number tool_indx,
-            # ignoring the tool calls history and mess up all the following tool calls
-            first_chunk_call.tool_index = 0
-            first_chunk_call.name = "get_weather"
-            first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
+            first_chunk_call = ToolCallItem(
+                tool_index=0,
+                name="get_weather",
+                parameters="",
+            )
+            parser_instance.parse_stream_chunk_result.side_effect = [
+                StreamingParseResult(calls=[first_chunk_call]),
+                StreamingParseResult(),
             ]
 
             async def collect_first_tool_chunk():
@@ -2075,6 +2078,64 @@ class ServingChatTestCase(unittest.TestCase):
             {"command": "git status", "description": "Show commits ahead of main"},
         )
 
+    def test_complete_tool_call_precedes_same_increment_postamble(self):
+        """A complete invoke and its suffix preserve model-output order."""
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Search"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        delta = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="query" string="true">sglang'
+            "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>\n"
+            "After."
+        )
+        emitted = []
+
+        async def collect():
+            async for line in self.chat._process_tool_call_stream(
+                index=0,
+                delta=delta,
+                parser_dict={},
+                content={"meta_info": {"id": "chatcmpl-whole-call-ordering"}},
+                request=request,
+                has_tool_calls={},
+            ):
+                emitted.append(json.loads(line[len("data: ") :]))
+
+        get_or_create_event_loop().run_until_complete(collect())
+
+        deltas = [chunk["choices"][0]["delta"] for chunk in emitted]
+        call_positions = [i for i, item in enumerate(deltas) if item.get("tool_calls")]
+        text_position = next(
+            i for i, item in enumerate(deltas) if item.get("content") == "After."
+        )
+        self.assertTrue(call_positions)
+        self.assertTrue(all(i < text_position for i in call_positions))
+        arguments = "".join(
+            item["tool_calls"][0]["function"].get("arguments") or ""
+            for item in deltas
+            if item.get("tool_calls")
+        )
+        self.assertEqual(json.loads(arguments), {"query": "sglang"})
+
     def test_terminal_tool_argument_flush_precedes_postamble_content(self):
         """The finish-time safety flush obeys the same tool-before-text order."""
         self.chat.tool_call_parser = "deepseekv4"
@@ -2089,8 +2150,10 @@ class ServingChatTestCase(unittest.TestCase):
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as parser_cls:
             parser = parser_cls.return_value
-            parser.parse_stream_chunk.return_value = ("\n", [])
-            parser.parse_stream_end.return_value = ("", [])
+            parser.parse_stream_chunk_result.return_value = StreamingParseResult(
+                normal_text="\n"
+            )
+            parser.parse_stream_end_result.return_value = StreamingParseResult()
             parser.detector.prev_tool_call_arr = [
                 {"name": "lookup", "arguments": '{"query": "sglang"}'}
             ]

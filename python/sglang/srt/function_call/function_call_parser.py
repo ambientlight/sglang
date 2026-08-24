@@ -14,7 +14,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -163,19 +163,19 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        parsed_result = self.parse_stream_chunk_result(chunk_text)
+        return parsed_result.normal_text, list(parsed_result.calls)
+
+    def parse_stream_chunk_result(self, chunk_text: str) -> StreamingParseResult:
+        """Return the detector's complete incremental result.
+
+        ``parse_stream_chunk`` remains the compatibility API.  Streaming
+        serving code uses this richer form when a detector supplies
+        ``ordered_items`` for text/tool interleaving.
+        """
         if not self.tools:
-            return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
-
-        return final_normal_text, final_calls
+            return StreamingParseResult(normal_text=chunk_text)
+        return self.detector.parse_streaming_increment(chunk_text, self.tools)
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -183,10 +183,14 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
+        parsed_result = self.parse_stream_end_result()
+        return parsed_result.normal_text, list(parsed_result.calls)
+
+    def parse_stream_end_result(self) -> StreamingParseResult:
+        """Return the detector's complete terminal flush result."""
         if not self.tools:
-            return "", []
-        sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+            return StreamingParseResult()
+        return self.detector.finish(self.tools)
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False

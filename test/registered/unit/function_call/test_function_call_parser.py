@@ -10,7 +10,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
@@ -2116,6 +2116,50 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(params["topn"], 10)
         self.assertEqual(params["obj"]["name"], "John")
         self.assertEqual(params["obj"]["age"], 30)
+
+    def test_streaming_result_preserves_text_and_tool_order(self):
+        text = (
+            "Before.\n"
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="search">'
+            '<｜DSML｜parameter name="query" string="true">one'
+            "</｜DSML｜parameter>"
+            "</｜DSML｜invoke>\n"
+            "Between.\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '<｜DSML｜parameter name="city" string="true">Paris'
+            "</｜DSML｜parameter>"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>\n"
+            "After."
+        )
+
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertIsNotNone(result.ordered_items)
+        item_kinds = [
+            "text" if isinstance(item, str) else item.name or "arguments"
+            for item in result.ordered_items
+        ]
+        self.assertEqual(
+            item_kinds,
+            [
+                "text",
+                "search",
+                "arguments",
+                "text",
+                "get_favorite_tourist_spot",
+                "arguments",
+                "text",
+            ],
+        )
+        texts = [item for item in result.ordered_items if isinstance(item, str)]
+        self.assertEqual(texts, ["Before.\n", "\nBetween.\n", "After."])
+        calls = [
+            item for item in result.ordered_items if isinstance(item, ToolCallItem)
+        ]
+        self.assertEqual(json.loads(calls[1].parameters), {"query": "one"})
+        self.assertEqual(json.loads(calls[3].parameters), {"city": "Paris"})
 
     def test_get_model_structural_tag(self):
         import xgrammar as xgr

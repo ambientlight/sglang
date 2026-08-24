@@ -31,9 +31,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
 
-    def __init__(self, stream_lines=None, chat_template=None):
+    def __init__(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
+        self.chat_encoding_spec = chat_encoding_spec
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
@@ -166,8 +167,10 @@ class TestAnthropicServing(unittest.TestCase):
 {%- endfor -%}
 """
 
-    def _serving(self, stream_lines=None, chat_template=None):
-        return AnthropicServing(_FakeOpenAIServingChat(stream_lines, chat_template))
+    def _serving(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
+        return AnthropicServing(
+            _FakeOpenAIServingChat(stream_lines, chat_template, chat_encoding_spec)
+        )
 
     def _anthropic_request(self, **overrides):
         data = {
@@ -1488,14 +1491,19 @@ class TestAnthropicServing(unittest.TestCase):
             messages=[
                 {"role": "user", "content": "hi"},
                 {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "assistant", "content": "Understood."},
                 {"role": "user", "content": "go"},
             ],
         )
         self.assertIsNone(request.system)
-        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
         )
         self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
 
@@ -1510,14 +1518,19 @@ class TestAnthropicServing(unittest.TestCase):
             messages=[
                 {"role": "user", "content": "hi"},
                 {"role": "system", "content": "One word only."},
+                {"role": "assistant", "content": "Okay."},
                 {"role": "user", "content": "go"},
             ],
         )
         self.assertEqual(request.system, "You are terse.")
-        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
         )
         self.assertEqual(
             chat_request.messages[0].content, "You are terse.\nOne word only."
@@ -1535,13 +1548,14 @@ class TestAnthropicServing(unittest.TestCase):
             messages=[
                 {"role": "user", "content": "hi"},
                 {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "assistant", "content": "Understood."},
                 {"role": "user", "content": "go"},
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
             [m.role for m in chat_request.messages],
-            ["system", "user", "system", "user"],
+            ["system", "user", "system", "assistant", "user"],
         )
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
@@ -1586,15 +1600,54 @@ class TestAnthropicServing(unittest.TestCase):
             messages=[
                 AnthropicMessage(role="user", content="hi"),
                 AnthropicMessage(role="system", content="be terse"),
+                AnthropicMessage(role="assistant", content="Okay."),
                 AnthropicMessage(role="user", content="go"),
             ],
         )
-        self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
         )
         self.assertEqual(chat_request.messages[0].content, "be terse")
+
+    def test_inline_system_rejects_invalid_user_system_user_placement(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "followed by an assistant"):
+            serving._convert_to_chat_completion_request(request)
+
+    def test_dsv4_inline_system_uses_native_latest_reminder(self):
+        serving = self._serving(chat_encoding_spec="dsv4")
+        request = self._anthropic_request(
+            stream=False,
+            system="Global instruction.",
+            messages=[
+                {"role": "user", "content": "Question"},
+                {"role": "system", "content": "Current reminder."},
+            ],
+        )
+
+        chat_request = serving._convert_to_chat_completion_request(request)
+
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "latest_reminder", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "Global instruction.")
+        self.assertEqual(chat_request.messages[1].content, "Current reminder.")
+        self.assertEqual(chat_request.messages[2].content, "Question")
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""
