@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +20,29 @@ logger = logging.getLogger(__name__)
 DSV4_REASONING_EFFORT_PROFILE_OVERRIDE = "dsv4_reasoning_effort_profile"
 _DSV4_REASONING_EFFORT_ENCODER = "encoding/encoding_dsv4.py"
 _MAX_DSV4_ENCODER_BYTES = 1 << 20
+
+
+class InlineSystemStrategy(str, Enum):
+    """How an effective chat renderer represents inline system messages."""
+
+    MERGE = "merge"
+    PASSTHROUGH = "passthrough"
+    LATEST_REMINDER = "latest_reminder"
+
+
+_CUSTOM_ENCODER_INLINE_SYSTEM_STRATEGIES = {
+    "dsv4": InlineSystemStrategy.LATEST_REMINDER,
+    "dsv32": InlineSystemStrategy.MERGE,
+    "inkling": InlineSystemStrategy.PASSTHROUGH,
+}
+
+
+def custom_encoder_inline_system_strategy(
+    spec: Optional[str],
+) -> Optional[InlineSystemStrategy]:
+    """Return the inline-system strategy owned by a custom encoder, if any."""
+
+    return _CUSTOM_ENCODER_INLINE_SYSTEM_STRATEGIES.get(spec)
 
 
 def _detect_dsv4_reasoning_effort_profile(

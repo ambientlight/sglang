@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
 from fastapi import Request
@@ -22,6 +23,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensResponse,
     AnthropicError,
     AnthropicErrorResponse,
+    AnthropicMessage,
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -42,6 +44,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     ThinkingDelta,
     ToolUseBlock,
     is_server_tool,
+)
+from sglang.srt.entrypoints.openai.chat_encoding import (
+    InlineSystemStrategy,
+    custom_encoder_inline_system_strategy,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -154,6 +160,131 @@ def _extract_system_text(
     return "\n".join(texts) if texts else None
 
 
+@dataclass(frozen=True)
+class _LatestReminderMessage:
+    """Internal marker emitted while normalizing Anthropic messages for DSV4."""
+
+    content: str
+
+
+def _validate_inline_system_placement(
+    messages: list[AnthropicMessage],
+) -> None:
+    """Validate Anthropic's placement rules for inline system-message runs.
+
+    Consecutive system messages form one section. A section must immediately
+    follow a user turn (including a user turn containing tool results), and it
+    must either end the request or be immediately followed by an assistant
+    turn. Anthropic also permits placement after an assistant turn ending in a
+    server-tool result, but those server-result block variants are not yet part
+    of SGLang's Anthropic protocol union and are rejected during request
+    parsing before this function runs.
+    """
+
+    index = 0
+    while index < len(messages):
+        if messages[index].role != "system":
+            index += 1
+            continue
+
+        run_start = index
+        while index < len(messages) and messages[index].role == "system":
+            index += 1
+
+        if run_start == 0 or messages[run_start - 1].role != "user":
+            raise ValueError(
+                "A mid-conversation system message must immediately follow a "
+                "user turn (placement after assistant server-tool results is "
+                "not yet supported)"
+            )
+        if index < len(messages) and messages[index].role != "assistant":
+            raise ValueError(
+                "A mid-conversation system message must end messages or be "
+                "immediately followed by an assistant turn"
+            )
+
+
+def _text_only_inline_system_content(
+    content: Union[str, list[AnthropicContentBlock]],
+) -> str:
+    """Return DSV4 reminder text without silently discarding content blocks."""
+
+    if isinstance(content, str):
+        text = content
+    else:
+        texts: list[str] = []
+        for block in content:
+            block_type = (
+                getattr(block, "type", None)
+                if isinstance(block, BaseModel)
+                else block.get("type")
+            )
+            if block_type != "text":
+                raise ValueError(
+                    "DeepSeek-V4 inline system messages support text content only; "
+                    f"got content block type {block_type!r}"
+                )
+            block_text = (
+                getattr(block, "text", "")
+                if isinstance(block, BaseModel)
+                else block.get("text", "")
+            )
+            texts.append(block_text)
+        text = "\n".join(texts)
+
+    if not text.strip():
+        raise ValueError(
+            "DeepSeek-V4 inline system messages must contain non-empty text"
+        )
+    return text
+
+
+def _normalize_dsv4_inline_system_messages(
+    messages: list[AnthropicMessage],
+) -> list[Union[AnthropicMessage, _LatestReminderMessage]]:
+    """Map valid Anthropic system sections to DSV4 ``latest_reminder``.
+
+    DeepSeek-V4's reference encoder places ``latest_reminder`` before the user
+    turn it qualifies. Normalize at the Anthropic-message boundary so a user
+    containing text plus one or more tool results remains a single logical
+    group when the existing converter later expands it to OpenAI messages.
+    """
+
+    normalized: list[Union[AnthropicMessage, _LatestReminderMessage]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.role != "user":
+            normalized.append(message)
+            index += 1
+            continue
+
+        user_end = index + 1
+        while user_end < len(messages) and messages[user_end].role == "user":
+            user_end += 1
+
+        system_start = user_end
+        system_end = system_start
+        while system_end < len(messages) and messages[system_end].role == "system":
+            system_end += 1
+
+        if system_end == system_start:
+            normalized.extend(messages[index:user_end])
+            index = user_end
+            continue
+
+        reminder_parts = [
+            _text_only_inline_system_content(messages[i].content)
+            for i in range(system_start, system_end)
+        ]
+        reminder = _LatestReminderMessage(content="\n".join(reminder_parts))
+        normalized.append(reminder)
+        normalized.extend(messages[index:user_end])
+        index = system_end
+
+    return normalized
+
+
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
@@ -191,8 +322,22 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
+        custom_strategy = custom_encoder_inline_system_strategy(
+            getattr(openai_serving_chat, "chat_encoding_spec", None)
+        )
+        if custom_strategy is not None:
+            self._inline_system_strategy = custom_strategy
+        elif detect_inline_system_support(self._chat_template()):
+            self._inline_system_strategy = InlineSystemStrategy.PASSTHROUGH
+        else:
+            self._inline_system_strategy = InlineSystemStrategy.MERGE
+
+        self._merge_inline_system = (
+            self._inline_system_strategy == InlineSystemStrategy.MERGE
+        )
+        logger.info(
+            "Anthropic inline system-message strategy: %s",
+            self._inline_system_strategy.value,
         )
 
     def _chat_template(self) -> Optional[str]:
@@ -232,6 +377,14 @@ class AnthropicServing:
     ) -> ChatCompletionRequest:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
+
+        _validate_inline_system_placement(anthropic_request.messages)
+        if self._inline_system_strategy == InlineSystemStrategy.LATEST_REMINDER:
+            conversion_messages = _normalize_dsv4_inline_system_messages(
+                anthropic_request.messages
+            )
+        else:
+            conversion_messages = anthropic_request.messages
 
         def _convert_anthropic_image_source_to_openai_part(
             source: Any,
@@ -450,7 +603,12 @@ class AnthropicServing:
             parts.clear()
 
         # Convert messages
-        for msg in anthropic_request.messages:
+        for msg in conversion_messages:
+            if isinstance(msg, _LatestReminderMessage):
+                openai_messages.append(
+                    {"role": "latest_reminder", "content": msg.content}
+                )
+                continue
             if msg.role == "system" and self._merge_inline_system:
                 continue
             if isinstance(msg.content, str):
