@@ -2415,6 +2415,41 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    def test_dsv4_tool_error_is_explicit_inside_tool_result(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        error_prompt = encoding_dsv4.encode_messages(
+            [
+                {"role": "system", "content": ""},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "permission denied",
+                    "is_error": True,
+                },
+            ],
+            thinking_mode="chat",
+        )
+        success_prompt = encoding_dsv4.encode_messages(
+            [
+                {"role": "system", "content": ""},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "permission denied",
+                    "is_error": False,
+                },
+            ],
+            thinking_mode="chat",
+        )
+        self.assertIn(
+            "<tool_result>Tool execution failed. Treat the following as an "
+            "error result:\npermission denied</tool_result>",
+            error_prompt,
+        )
+        self.assertIn("<tool_result>permission denied</tool_result>", success_prompt)
+        self.assertNotIn("Tool execution failed", success_prompt)
+
     def test_dsv4_reasoning_effort_profiles(self):
         from sglang.srt.entrypoints.openai import encoding_dsv4
 

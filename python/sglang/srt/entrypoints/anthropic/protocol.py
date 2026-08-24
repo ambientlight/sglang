@@ -270,8 +270,9 @@ class AnthropicThinkingParam(BaseModel):
     equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
     compatibility but the backend has no hard-cap knob to honor it; the
     serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` is accepted but
-    similarly cannot suppress reasoning mid-stream and is logged.
+    budget is not enforced. ``display="omitted"`` suppresses reasoning
+    text and returns an authenticated opaque signature that restores the
+    hidden reasoning when it is passed back on a later turn.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -284,13 +285,13 @@ class AnthropicThinkingParam(BaseModel):
         if self.type == "enabled":
             if self.budget_tokens is None:
                 raise ValueError(
-                    "thinking.budget_tokens is required when "
-                    "thinking.type is 'enabled'"
+                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
                 )
             if self.budget_tokens < 1024:
                 raise ValueError(
-                    "thinking.budget_tokens must be >= 1024 "
-                    "(got {})".format(self.budget_tokens)
+                    "thinking.budget_tokens must be >= 1024 (got {})".format(
+                        self.budget_tokens
+                    )
                 )
         elif self.type == "disabled":
             if self.budget_tokens is not None:
@@ -300,8 +301,7 @@ class AnthropicThinkingParam(BaseModel):
                 )
             if self.display is not None:
                 raise ValueError(
-                    "thinking.display is not allowed when "
-                    "thinking.type is 'disabled'"
+                    "thinking.display is not allowed when thinking.type is 'disabled'"
                 )
         elif self.type == "adaptive":
             if self.budget_tokens is not None:

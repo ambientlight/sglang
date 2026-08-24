@@ -23,6 +23,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
+  "cryptography>=41.0.0",
   "cuda-python>=13.0",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",

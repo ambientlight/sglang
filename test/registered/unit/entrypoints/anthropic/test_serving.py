@@ -14,7 +14,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+    AnthropicServing,
+    _ThinkingSignatureCodec,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -167,10 +170,19 @@ class TestAnthropicServing(unittest.TestCase):
 {%- endfor -%}
 """
 
-    def _serving(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
-        return AnthropicServing(
+    def _serving(
+        self,
+        stream_lines=None,
+        chat_template=None,
+        chat_encoding_spec=None,
+        with_thinking_codec=False,
+    ):
+        serving = AnthropicServing(
             _FakeOpenAIServingChat(stream_lines, chat_template, chat_encoding_spec)
         )
+        if with_thinking_codec:
+            serving._thinking_signature_codec = _ThinkingSignatureCodec(b"k" * 32)
+        return serving
 
     def _anthropic_request(self, **overrides):
         data = {
@@ -365,6 +377,53 @@ class TestAnthropicServing(unittest.TestCase):
         ]
         self.assertEqual(sig_deltas, [])
 
+    def test_stream_omitted_thinking_is_sealed_not_emitted(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"reasoning_content": "hidden analysis"})]),
+                _chunk([_choice({"content": "answer"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ],
+            with_thinking_codec=True,
+        )
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "omitted"}
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        content_events = [
+            event for event in events if event["type"].startswith("content_block")
+        ]
+        self.assertEqual(
+            content_events[0]["content_block"],
+            {"type": "thinking", "thinking": ""},
+        )
+        self.assertFalse(
+            any(
+                event.get("delta", {}).get("type") == "thinking_delta"
+                for event in content_events
+            )
+        )
+        signature_event = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "signature_delta"
+        )
+        signature = signature_event["delta"]["signature"]
+        self.assertTrue(signature.startswith("sglang_thinking_v1."))
+        self.assertEqual(
+            serving._thinking_signature_codec.unseal(signature, "test-model"),
+            "hidden analysis",
+        )
+        text_delta = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "text_delta"
+        )
+        self.assertEqual(text_delta["delta"]["text"], "answer")
+
     def test_stream_usage_subtracts_cache_read_and_omits_final_input_tokens(self):
         usage = {
             "prompt_tokens": 10,
@@ -541,6 +600,29 @@ class TestAnthropicServing(unittest.TestCase):
                 {"type": "tool_reference", "name": "Read"},
             ],
         )
+
+    def test_tool_result_error_bit_survives_anthropic_conversion(self):
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "permission denied",
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ],
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = next(
+            message for message in chat_request.messages if message.role == "tool"
+        )
+        self.assertIs(tool_message.is_error, True)
 
     def test_builtin_web_search_tool_without_schema_is_skipped(self):
         request = AnthropicMessagesRequest.model_validate(
@@ -849,6 +931,44 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
+    def test_non_streaming_omitted_thinking_is_empty_and_signed(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_content": "private reasoning",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 5,
+                    "total_tokens": 8,
+                },
+            }
+        )
+        serving = self._serving(with_thinking_codec=True)
+        request = self._anthropic_request(
+            stream=False,
+            thinking={"type": "adaptive", "display": "omitted"},
+        )
+        anthropic_response = serving._convert_response(response, request)
+        thinking = anthropic_response.content[0]
+        self.assertEqual(thinking.type, "thinking")
+        self.assertEqual(thinking.thinking, "")
+        self.assertTrue(thinking.signature.startswith("sglang_thinking_v1."))
+        self.assertEqual(
+            serving._thinking_signature_codec.unseal(thinking.signature, "test-model"),
+            "private reasoning",
+        )
+
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
         serving = self._serving()
@@ -933,12 +1053,8 @@ class TestAnthropicServing(unittest.TestCase):
         serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
 
-    def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
-        """``thinking.display='omitted'`` is accepted; reasoning stays on
-        because we cannot suppress reasoning text from the OpenAI stream.
-        ``enabled`` requires ``budget_tokens`` per SDK shape."""
-        import logging
-
+    def test_request_thinking_display_omitted_still_enables_reasoning(self):
+        """Omitting display suppresses wire text, not model reasoning."""
         serving = self._serving()
         request = self._anthropic_request(
             thinking={
@@ -948,12 +1064,59 @@ class TestAnthropicServing(unittest.TestCase):
             },
             stream=False,
         )
-        with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
-        ) as log:
-            serving._convert_to_chat_completion_request(request)
+        serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
-        self.assertTrue(any("omitted" in r for r in log.output))
+
+    def test_omitted_thinking_without_server_key_fails_closed(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "omitted"},
+            stream=False,
+        )
+        response = asyncio.run(serving.handle_messages(request, object()))
+        self.assertEqual(response.status_code, 500)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["error"]["type"], "api_error")
+
+    def test_thinking_signature_codec_rejects_tamper_and_wrong_model(self):
+        codec = _ThinkingSignatureCodec(b"k" * 32)
+        signature = codec.seal("private reasoning", "model-a")
+        self.assertEqual(codec.unseal(signature, "model-a"), "private reasoning")
+        replacement = "A" if signature[-1] != "A" else "B"
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature[:-1] + replacement, "model-a")
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature, "model-b")
+
+    def test_sealed_thinking_history_restores_native_reasoning(self):
+        serving = self._serving(with_thinking_codec=True)
+        serving.openai_serving_chat.native_reasoning_history = True
+        signature = serving._thinking_signature_codec.seal(
+            "restored private reasoning", "test-model"
+        )
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": signature,
+                        },
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant = next(
+            message for message in chat_request.messages if message.role == "assistant"
+        )
+        self.assertEqual(assistant.reasoning_content, "restored private reasoning")
 
     def test_request_output_config_effort_maps_to_reasoning_effort(self):
         """``output_config.effort`` rows map onto ``reasoning_effort``."""

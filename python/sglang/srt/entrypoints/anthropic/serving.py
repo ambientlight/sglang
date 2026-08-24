@@ -7,12 +7,19 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import os
+import pathlib
 import uuid
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -90,6 +97,139 @@ ERROR_TYPE_MAP = {
     503: "overloaded_error",
     504: "api_error",
 }
+
+_THINKING_KEY_FILE_ENV = "SGLANG_ANTHROPIC_THINKING_KEY_FILE"
+_THINKING_SIGNATURE_PREFIX = "sglang_thinking_v1."
+_THINKING_SIGNATURE_AAD = b"sglang-anthropic-thinking-v1"
+_MAX_SEALED_THINKING_BYTES = 8 * 1024 * 1024
+
+
+class _ThinkingSignatureCodec:
+    """Seal hidden reasoning into an authenticated, stateless continuation token.
+
+    Anthropic clients treat ``thinking.signature`` as opaque and return it
+    unchanged on later turns. A local backend still needs the hidden text to
+    reconstruct the model prompt, so ``display=omitted`` cannot be implemented
+    by merely dropping reasoning. This codec encrypts a compressed,
+    model-bound payload with AES-256-GCM. The key lives outside the image and
+    must remain stable across container restarts.
+
+    Tokens deliberately carry an SGLang prefix. They are valid only on the
+    SGLang deployment holding the matching key; they never masquerade as an
+    Anthropic-issued signature.
+    """
+
+    def __init__(self, key: bytes):
+        if len(key) != 32:
+            raise ValueError("Anthropic thinking-signature key must be 32 bytes")
+        self._key_id = hashlib.sha256(key).hexdigest()[:16]
+        self._cipher = AESGCM(key)
+
+    @property
+    def key_id(self) -> str:
+        return self._key_id
+
+    @classmethod
+    def from_environment(cls) -> Optional["_ThinkingSignatureCodec"]:
+        key_path_value = os.environ.get(_THINKING_KEY_FILE_ENV)
+        if not key_path_value:
+            return None
+
+        key_path = pathlib.Path(key_path_value)
+        raw = key_path.read_bytes()
+        key = cls._decode_key_file(raw)
+        mode = key_path.stat().st_mode & 0o777
+        if mode & 0o077:
+            raise RuntimeError(
+                f"{_THINKING_KEY_FILE_ENV} must not be group/world accessible "
+                f"(mode is {mode:04o})"
+            )
+        return cls(key)
+
+    @staticmethod
+    def _decode_key_file(raw: bytes) -> bytes:
+        if len(raw) == 32:
+            return raw
+
+        encoded = raw.strip()
+        if len(encoded) == 64:
+            try:
+                decoded = bytes.fromhex(encoded.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                decoded = b""
+            if len(decoded) == 32:
+                return decoded
+
+        try:
+            decoded = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        except (ValueError, TypeError):
+            decoded = b""
+        if len(decoded) == 32:
+            return decoded
+        raise ValueError(
+            "Anthropic thinking-signature key file must contain 32 raw bytes, "
+            "64 hexadecimal characters, or base64 for 32 bytes"
+        )
+
+    @staticmethod
+    def is_local_signature(signature: str) -> bool:
+        return signature.startswith(_THINKING_SIGNATURE_PREFIX)
+
+    def seal(self, thinking: str, model: str) -> str:
+        payload = json.dumps(
+            {"model": model, "thinking": thinking, "version": 1},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > _MAX_SEALED_THINKING_BYTES:
+            raise ValueError("Thinking content is too large to seal")
+        compressed = zlib.compress(payload, level=6)
+        nonce = os.urandom(12)
+        aad = _THINKING_SIGNATURE_AAD + b":" + self._key_id.encode("ascii")
+        ciphertext = self._cipher.encrypt(nonce, compressed, aad)
+        token = base64.urlsafe_b64encode(nonce + ciphertext).rstrip(b"=")
+        return f"{_THINKING_SIGNATURE_PREFIX}{self._key_id}.{token.decode('ascii')}"
+
+    def unseal(self, signature: str, model: str) -> str:
+        try:
+            remainder = signature.removeprefix(_THINKING_SIGNATURE_PREFIX)
+            key_id, encoded = remainder.split(".", 1)
+            if key_id != self._key_id:
+                raise ValueError
+            if len(encoded) > 2 * _MAX_SEALED_THINKING_BYTES:
+                raise ValueError
+            padding = "=" * (-len(encoded) % 4)
+            sealed = base64.b64decode(
+                encoded + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+            if len(sealed) < 12 + 16:
+                raise ValueError
+            nonce, ciphertext = sealed[:12], sealed[12:]
+            aad = _THINKING_SIGNATURE_AAD + b":" + key_id.encode("ascii")
+            compressed = self._cipher.decrypt(nonce, ciphertext, aad)
+            payload = zlib.decompress(compressed)
+            if len(payload) > _MAX_SEALED_THINKING_BYTES:
+                raise ValueError
+            value = json.loads(payload)
+            if (
+                not isinstance(value, dict)
+                or value.get("version") != 1
+                or value.get("model") != model
+                or not isinstance(value.get("thinking"), str)
+            ):
+                raise ValueError
+            return value["thinking"]
+        except (
+            InvalidTag,
+            UnicodeDecodeError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+            zlib.error,
+        ) as error:
+            raise ValueError("Invalid SGLang thinking signature") from error
 
 
 def _cached_prompt_tokens(usage) -> int:
@@ -322,6 +462,12 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
+        self._thinking_signature_codec = _ThinkingSignatureCodec.from_environment()
+        if self._thinking_signature_codec is not None:
+            logger.info(
+                "Anthropic omitted-thinking signatures enabled (key id %s)",
+                self._thinking_signature_codec.key_id,
+            )
         custom_strategy = custom_encoder_inline_system_strategy(
             getattr(openai_serving_chat, "chat_encoding_spec", None)
         )
@@ -355,6 +501,18 @@ class AnthropicServing:
         raw_request: Request,
     ) -> Union[JSONResponse, StreamingResponse]:
         """Main entry point for /v1/messages endpoint."""
+        if self._request_requires_thinking_codec(request):
+            if self._thinking_signature_codec is None:
+                logger.error(
+                    "Anthropic omitted-thinking continuity requested but %s "
+                    "is not configured",
+                    _THINKING_KEY_FILE_ENV,
+                )
+                return self._error_response(
+                    status_code=500,
+                    error_type="api_error",
+                    message="Internal server error",
+                )
         try:
             chat_request = self._convert_to_chat_completion_request(request)
         except asyncio.CancelledError:
@@ -371,6 +529,27 @@ class AnthropicServing:
             return await self._handle_streaming(chat_request, request, raw_request)
         else:
             return await self._handle_non_streaming(chat_request, request, raw_request)
+
+    @staticmethod
+    def _request_requires_thinking_codec(
+        request: AnthropicMessagesRequest,
+    ) -> bool:
+        if request.thinking is not None and request.thinking.display == "omitted":
+            return True
+        return AnthropicServing._request_contains_local_thinking_signature(request)
+
+    @staticmethod
+    def _request_contains_local_thinking_signature(
+        request: AnthropicMessagesRequest,
+    ) -> bool:
+        return any(
+            block.type == "thinking"
+            and bool(block.signature)
+            and _ThinkingSignatureCodec.is_local_signature(block.signature)
+            for message in request.messages
+            if isinstance(message.content, list)
+            for block in message.content
+        )
 
     def _convert_to_chat_completion_request(
         self, anthropic_request: AnthropicMessagesRequest
@@ -539,11 +718,32 @@ class AnthropicServing:
             if any(block.type == "redacted_thinking" for block in blocks):
                 raise ValueError("Anthropic redacted_thinking history is not supported")
 
-            thinking_parts = [
-                block.thinking
-                for block in blocks
-                if block.type == "thinking" and block.thinking
-            ]
+            thinking_parts: list[str] = []
+            for block in blocks:
+                if block.type != "thinking":
+                    continue
+                if block.signature and _ThinkingSignatureCodec.is_local_signature(
+                    block.signature
+                ):
+                    if self._thinking_signature_codec is None:
+                        raise RuntimeError(
+                            "SGLang thinking-signature key is not configured"
+                        )
+                    thinking_parts.append(
+                        self._thinking_signature_codec.unseal(
+                            block.signature,
+                            anthropic_request.model,
+                        )
+                    )
+                elif block.thinking:
+                    # Visible/summarized thinking, including history produced by
+                    # pre-sealing SGLang versions, remains directly replayable.
+                    thinking_parts.append(block.thinking)
+                elif block.signature:
+                    raise ValueError(
+                        "Opaque thinking signature was not issued by this "
+                        "SGLang endpoint"
+                    )
             if not thinking_parts:
                 return None, None
 
@@ -686,6 +886,7 @@ class AnthropicServing:
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": tool_content,
+                                    "is_error": block.is_error,
                                 }
                             )
                     else:
@@ -767,16 +968,6 @@ class AnthropicServing:
             # because the local backend has no auto-throttle equivalent.
             # Anything other than ``disabled`` enables reasoning.
             enabled = anthropic_request.thinking.type != "disabled"
-            if anthropic_request.thinking.display == "omitted":
-                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
-                # text from the client. The OpenAI streaming pipeline has
-                # no equivalent suppress knob — log so operators can see
-                # the request, then proceed with normal reasoning emission.
-                logger.warning(
-                    "Anthropic thinking.display='omitted' is accepted for "
-                    "SDK compatibility but reasoning text will still be "
-                    "emitted to the client"
-                )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
@@ -942,7 +1133,7 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        anthropic_response = self._convert_response(response, anthropic_request)
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -1009,13 +1200,17 @@ class AnthropicServing:
         content_block_index = 0
         content_block_open = False
         content_block_type: Optional[str] = None
-        captured_thinking_signature: str = ""
+        captured_thinking_parts: list[str] = []
         finish_reason: Optional[str] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        omit_thinking = bool(
+            anthropic_request.thinking is not None
+            and anthropic_request.thinking.display == "omitted"
+        )
 
         def _message_start_event(usage) -> MessageStartEvent:
             return MessageStartEvent(
@@ -1040,21 +1235,26 @@ class AnthropicServing:
 
         def _close_content_block_events() -> list[AnthropicStreamEvent]:
             nonlocal content_block_index, content_block_open
-            nonlocal content_block_type, captured_thinking_signature
+            nonlocal content_block_type, captured_thinking_parts
 
             events: list[AnthropicStreamEvent] = []
             if not content_block_open:
                 return events
 
-            # Only emit signature_delta when a real signature is available.
-            # Anthropic's spec treats absence as "unsigned thinking"; an
-            # empty-string signature would fail downstream verifiers.
-            if content_block_type == "thinking" and captured_thinking_signature:
+            if content_block_type == "thinking" and omit_thinking:
+                if self._thinking_signature_codec is None:
+                    raise RuntimeError(
+                        "SGLang thinking-signature key is not configured"
+                    )
+                signature = self._thinking_signature_codec.seal(
+                    "".join(captured_thinking_parts),
+                    model,
+                )
                 events.append(
                     ContentBlockDeltaEvent(
                         index=content_block_index,
                         delta=SignatureDelta(
-                            signature=captured_thinking_signature,
+                            signature=signature,
                         ),
                     )
                 )
@@ -1063,7 +1263,7 @@ class AnthropicServing:
             content_block_open = False
             content_block_type = None
             content_block_index += 1
-            captured_thinking_signature = ""
+            captured_thinking_parts = []
             return events
 
         def _ensure_content_block_events(
@@ -1233,8 +1433,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
@@ -1341,12 +1540,15 @@ class AnthropicServing:
                 ):
                     yield _emit(event)
 
-                yield _emit(
-                    ContentBlockDeltaEvent(
-                        index=content_block_index,
-                        delta=ThinkingDelta(thinking=delta.reasoning_content),
+                if omit_thinking:
+                    captured_thinking_parts.append(delta.reasoning_content)
+                else:
+                    yield _emit(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=ThinkingDelta(thinking=delta.reasoning_content),
+                        )
                     )
-                )
                 had_content_delta = True
 
             # Handle tool call deltas
@@ -1424,7 +1626,9 @@ class AnthropicServing:
                 had_content_delta = True
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        anthropic_request: Optional[AnthropicMessagesRequest] = None,
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -1438,11 +1642,32 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
-        # Add reasoning content as a thinking block. signature is omitted
-        # entirely when the backend doesn't provide one — empty strings
-        # would fail downstream Anthropic signature verifiers.
+        omit_thinking = bool(
+            anthropic_request is not None
+            and anthropic_request.thinking is not None
+            and anthropic_request.thinking.display == "omitted"
+        )
+
+        # Visible mode returns the backend's reasoning directly. Omitted mode
+        # returns an empty block plus an authenticated token that lets a later
+        # request reconstruct the hidden reasoning without server-side state.
         if choice.message.reasoning_content:
-            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
+            if omit_thinking:
+                if self._thinking_signature_codec is None:
+                    raise RuntimeError(
+                        "SGLang thinking-signature key is not configured"
+                    )
+                content.append(
+                    ThinkingBlock(
+                        thinking="",
+                        signature=self._thinking_signature_codec.seal(
+                            choice.message.reasoning_content,
+                            anthropic_request.model,
+                        ),
+                    )
+                )
+            else:
+                content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
 
         # Add text content
         if choice.message.content:
@@ -1601,6 +1826,20 @@ class AnthropicServing:
                 tools=request.tools,
                 tool_choice=request.tool_choice,
             )
+            if (
+                self._request_contains_local_thinking_signature(messages_request)
+                and self._thinking_signature_codec is None
+            ):
+                logger.error(
+                    "Anthropic thinking-signature history requested but %s "
+                    "is not configured",
+                    _THINKING_KEY_FILE_ENV,
+                )
+                return self._error_response(
+                    status_code=500,
+                    error_type="api_error",
+                    message="Internal server error",
+                )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except asyncio.CancelledError:
             raise

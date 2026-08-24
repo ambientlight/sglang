@@ -696,6 +696,19 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Internal extension used by the Anthropic adapter. OpenAI represents tool
+    # results as ``role=tool`` messages but has no equivalent to Anthropic's
+    # ``tool_result.is_error`` bit. Keeping the bit structured until the
+    # model-specific encoder avoids flattening a failed result into an
+    # indistinguishable success.
+    is_error: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.is_error is None:
+            data.pop("is_error", None)
+        return data
 
     @field_validator("role", mode="before")
     @classmethod
