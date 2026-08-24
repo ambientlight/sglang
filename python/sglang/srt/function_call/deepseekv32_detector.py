@@ -110,6 +110,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or "<｜DSML｜invoke" in text
 
+    @classmethod
+    def _ends_with_partial_tool_tag(cls, text: str) -> bool:
+        """Return whether ``text`` ends inside a DSML tool-call tag."""
+        stripped = text.rstrip()
+        last_lt = stripped.rfind("<")
+        if last_lt == -1:
+            return False
+        tail = stripped[last_lt:]
+        return any(tag.startswith(tail) for tag in cls._DSML_TOOL_TAGS)
+
     @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
         """Returns (name, body, is_complete) for an invoke_regex match.
@@ -264,13 +274,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Find the last "<" in the text; everything from there to the end is a
         # candidate partial tag.  If any complete tag starts with this tail,
         # we buffer and wait for more data.
-        stripped = current_text.rstrip()
-        last_lt = stripped.rfind("<")
-        if last_lt != -1:
-            tail = stripped[last_lt:]
-            ends_with_prefix = any(tag.startswith(tail) for tag in self._DSML_TOOL_TAGS)
-        else:
-            ends_with_prefix = False
+        ends_with_prefix = self._ends_with_partial_tool_tag(current_text)
 
         if (
             not self.has_tool_call(current_text)
@@ -284,9 +288,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
-        # Only recovered for the first call: the DSML guard above never releases a
-        # buffer that still holds a marker, so later prose stays buffered.
-        preamble = ""
+        normal_text_parts: list[str] = []
+
+        def normal_prefix(end: int) -> str:
+            """Return ordinary text before an invoke, excluding DSML wrappers."""
+            prefix = current_text[:end]
+            bot_pos = current_text.rfind(self.bot_token, 0, end)
+            if bot_pos != -1:
+                prefix = current_text[:bot_pos]
+            for token in (self.eot_token, self.invoke_end_token):
+                prefix = prefix.replace(token, "")
+            if self.eot_token in current_text[:end]:
+                prefix = prefix.lstrip("\n")
+            return prefix.removesuffix("\n\n")
+
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -303,8 +318,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
+                # Record the text before each invoke.  The first call's
+                # preamble and any text between later calls are both normal
+                # response content, not part of the tool-call payload.
+                first_tool_call = self.current_tool_id == -1
+                if first_tool_call:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
@@ -313,7 +331,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     if bot_pos != -1:
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+                    normal_text_parts.append(normal_prefix(call_start))
+                else:
+                    normal_text_parts.append(normal_prefix(invoke_match.start()))
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -388,8 +408,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text=preamble, calls=all_calls)
+            # Preserve ordinary text after a completed invoke.  Previously this
+            # suffix stayed in ``_buffer`` but was omitted from the result, so
+            # streaming responses lost text generated after a tool call.
+            postamble = current_text
+            had_wrapper_end = self.eot_token in postamble
+            for token in (self.eot_token, self.invoke_end_token):
+                postamble = postamble.replace(token, "")
+            if had_wrapper_end:
+                postamble = postamble.lstrip("\n")
+
+            if (
+                postamble
+                and not any(tag in postamble for tag in self._DSML_TOOL_TAGS)
+                and not self._ends_with_partial_tool_tag(postamble)
+            ):
+                normal_text_parts.append(postamble)
+                self._buffer = ""
+
+            return StreamingParseResult(
+                normal_text="".join(normal_text_parts), calls=all_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
@@ -400,7 +439,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self.current_tool_name_sent = False
             self.prev_tool_call_arr = []
             self.streamed_args_for_tool = [""]
-            return StreamingParseResult(normal_text=preamble)
+            return StreamingParseResult(normal_text="".join(normal_text_parts))
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         """Flush any text trapped in the buffer when the stream ends.
