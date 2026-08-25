@@ -222,6 +222,14 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    # Once scheduler dispatch succeeds, exceptional local cleanup must send an
+    # AbortReq before dropping this state.  Otherwise the scheduler keeps
+    # decoding an orphan whose outputs can only produce "state was deleted"
+    # warnings in TokenizerManager.
+    dispatched: bool = False
+    # Deduplicate cleanup, delayed-disconnect, and explicit abort paths while
+    # retaining the state until the scheduler confirms request termination.
+    abort_sent: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -794,6 +802,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        request_rids = (
+            {obj.rid}
+            if not hasattr(obj, "is_single") or obj.is_single
+            else set(obj.rid)
+        )
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -817,17 +830,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
+                    async for response in self._handle_batch_request(
+                        obj, request, request_rids
+                    ):
                         yield response
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
             # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # request -- would otherwise leak those entries forever. Drop
+            # undelivered states, but abort dispatched work and retain its state
+            # until scheduler-side cleanup is confirmed.
+            self._release_req_states_on_failure(request_rids)
             raise
 
     def _detect_input_format(
@@ -1609,12 +1624,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
+            self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+
+    def _mark_state_dispatched(self, rid: str):
+        """Record that *rid* reached the scheduler."""
+        state = self.rid_to_state.get(rid)
+        if state is not None:
+            state.dispatched = True
 
     def _send_batch_request(
         self,
@@ -1641,6 +1663,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
             self._dispatch_to_scheduler(batch_req)
+            for tokenized_obj in tokenized_objs:
+                self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
@@ -1842,7 +1866,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        request_rids: Optional[set[str]] = None,
     ):
+        if request_rids is None:
+            request_rids = set(obj.rid)
         batch_size = obj.batch_size
 
         generators = []
@@ -1908,6 +1935,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
+                request_rids.add(tmp_obj.rid)
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -1924,6 +1952,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
+                    request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -1993,14 +2022,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
+        state = None if abort_all else self.rid_to_state.get(rid)
+        if not abort_all:
+            if state is not None:
+                if state.abort_sent:
+                    return
+                state.abort_sent = True
+            elif self.server_args.tokenizer_worker_num == 1:
+                return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self._dispatch_to_scheduler(req)
+        try:
+            self._dispatch_to_scheduler(req)
+        except BaseException:
+            if state is not None:
+                state.abort_sent = False
+            raise
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -2161,10 +2197,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
+            rids = [obj.rid] if obj.is_single else obj.rid
+            for rid in rids:
+                if rid in self.rid_to_state:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
@@ -3416,19 +3451,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+    def _release_req_states_on_failure(self, rids: Iterable[str]):
+        """Release states owned by a failed request handler.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Undelivered states are removed locally. Dispatched requests are aborted
+        once and retained until the scheduler response removes them, so in-flight
+        output cannot race against a missing tokenizer state.
         """
-        if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            if state.dispatched:
+                try:
+                    self.abort_request(rid)
+                except Exception:
+                    # Preserve the original cancellation/parser exception. The
+                    # state and cleared abort_sent bit allow the delayed path to
+                    # retry if the scheduler transport failure was transient.
+                    logger.exception("Failed to abort request %s during cleanup", rid)
+            else:
+                del self.rid_to_state[rid]
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

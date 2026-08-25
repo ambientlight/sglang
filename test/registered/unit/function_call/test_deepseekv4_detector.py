@@ -309,6 +309,75 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.calls, [])
 
+    def test_capture_derived_malformed_reserved_dsml_fails_closed(self):
+        samples = [
+            f"</{DSML}tool_api_call让头先看看这些文件",
+            f"</{DSML} bottled </parameter>",
+            f"Text before <{DSML}tool_crossing",
+            f"</{DSML}block>",
+            f"</{DSML}function_calls> → Fix the malformed closing tag",
+            f"Text before <{DSML}tool_calls\n<{DSML}invoke " 'name="get_weather">',
+            f'<{DSML}invoke name="get_weather <{DSML}parameter ' "name subject para?>",
+            f'<{DSML}invoke name="get_weather" false=""/>',
+        ]
+        for text in samples:
+            with self.subTest(path="non-stream", text=text):
+                with self.assertRaises(MalformedToolCallError):
+                    DeepSeekV4Detector().detect_and_parse(text, self.tools)
+            with self.subTest(path="stream", text=text):
+                with self.assertRaises(MalformedToolCallError):
+                    DeepSeekV4Detector().parse_streaming_increment(text, self.tools)
+
+    def test_malformed_reserved_dsml_is_held_across_chunks(self):
+        detector = DeepSeekV4Detector()
+        first = detector.parse_streaming_increment(
+            f"Safe preamble. <{DSML}tool_", self.tools
+        )
+
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(first.calls, [])
+        with self.assertRaises(MalformedToolCallError):
+            detector.parse_streaming_increment("crossing", self.tools)
+
+    def test_capture_derived_unclosed_wrapper_fails_across_chunks(self):
+        detector = DeepSeekV4Detector()
+        first = detector.parse_streaming_increment(
+            f"Safe preamble. <{DSML}tool_calls\n", self.tools
+        )
+
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(first.calls, [])
+        with self.assertRaises(MalformedToolCallError):
+            detector.parse_streaming_increment(
+                f'<{DSML}invoke name="get_weather">', self.tools
+            )
+
+    def test_incomplete_reserved_dsml_is_not_leaked_at_stream_end(self):
+        detector = DeepSeekV4Detector()
+        detector.parse_streaming_increment(f"Safe preamble. <{DSML}tool_", self.tools)
+
+        result = detector.finish(self.tools)
+
+        self.assertEqual(result.normal_text, "Safe preamble. ")
+        self.assertNotIn(DSML, result.normal_text)
+
+    def test_dsml_parameter_example_remains_normal_text(self):
+        text = f'The literal `<{DSML}parameter name="x">` is a parameter tag.'
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
+    def test_reserved_dsml_text_inside_tool_argument_is_not_rejected(self):
+        value = f"literal <{DSML}custom_marker> data"
+        text = _wrapped(_invoke("get_weather", _param("city", "true", value)))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertIn("custom_marker", result.calls[0].parameters)
+
 
 if __name__ == "__main__":
     import unittest

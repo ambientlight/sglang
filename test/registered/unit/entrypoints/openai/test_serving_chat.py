@@ -37,7 +37,11 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
+from sglang.srt.function_call.core_types import (
+    MalformedToolCallError,
+    StreamingParseResult,
+    ToolCallItem,
+)
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -96,6 +100,8 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.model_config.get_default_sampling_params.return_value = {}
+        self.preferred_sampling_params = None
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -192,6 +198,39 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_preferred_sampling_params_override_model_defaults_only_when_omitted(self):
+        self.tm.model_config.get_default_sampling_params.return_value = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+        }
+        self.tm.preferred_sampling_params = {
+            "temperature": 0.2,
+            "top_p": 0.95,
+        }
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        omitted = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+        ).to_sampling_params(
+            stop=[], model_generation_config=chat.default_sampling_params
+        )
+        explicit = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            temperature=0.7,
+            top_p=0.8,
+        ).to_sampling_params(
+            stop=[], model_generation_config=chat.default_sampling_params
+        )
+
+        self.assertEqual(omitted["temperature"], 0.2)
+        self.assertEqual(omitted["top_p"], 0.95)
+        self.assertEqual(explicit["temperature"], 0.7)
+        self.assertEqual(explicit["top_p"], 0.8)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
@@ -1193,6 +1232,90 @@ class ServingChatTestCase(unittest.TestCase):
                     self.chat._validate_request(duplicate),
                     "Tool names must be unique across request and message tools.",
                 )
+
+    def test_dsv_encoders_omit_tools_when_tool_choice_is_none(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        self.chat.tool_call_parser = None
+        request_tool = {
+            "type": "function",
+            "function": {
+                "name": "request_tool",
+                "parameters": {"type": "object"},
+            },
+        }
+        message_tool = {
+            "type": "function",
+            "function": {
+                "name": "message_tool",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            for message_role in ("system", "developer"):
+                with self.subTest(
+                    chat_encoding_spec=chat_encoding_spec, message_role=message_role
+                ):
+                    self.chat.chat_encoding_spec = chat_encoding_spec
+                    self.tm.tokenizer.encode.reset_mock()
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[
+                            {
+                                "role": message_role,
+                                "content": "Follow the request.",
+                                "tools": [message_tool],
+                            },
+                            {"role": "user", "content": "Answer directly."},
+                        ],
+                        tools=[request_tool],
+                        tool_choice="none",
+                    )
+
+                    self.chat._process_messages(req, is_multimodal=False)
+
+                    prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertNotIn("## Tools", prompt)
+                    self.assertNotIn("request_tool", prompt)
+                    self.assertNotIn("message_tool", prompt)
+                    self.assertNotIn("<｜DSML｜tool_calls>", prompt)
+                    self.assertNotIn("<｜DSML｜function_calls>", prompt)
+                    self.assertEqual(req.tools[0].function.name, "request_tool")
+                    self.assertEqual(
+                        req.messages[0].tools[0].function.name, "message_tool"
+                    )
+
+    def test_dsv_encoders_keep_tools_when_tool_choice_is_auto(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        self.chat.tool_call_parser = None
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "request_tool",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                self.tm.tokenizer.encode.reset_mock()
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Use the tool."}],
+                    tools=[tool],
+                    tool_choice="auto",
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertIn("## Tools", prompt)
+                self.assertIn("request_tool", prompt)
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
@@ -2713,6 +2836,49 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_streaming_parser_failure_closes_generation_stream(self):
+        """A parser rejection must immediately release scheduler ownership."""
+        stream_closed = False
+
+        async def _mock_generate():
+            nonlocal stream_closed
+            try:
+                yield {
+                    "text": "partial malformed tool output",
+                    "meta_info": {
+                        "id": "chatcmpl-malformed",
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": None,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+            finally:
+                stream_closed = True
+
+        async def _reject_content(**_kwargs):
+            raise MalformedToolCallError("malformed tool protocol")
+            yield  # pragma: no cover
+
+        self.tm.generate_request.return_value = _mock_generate()
+        self.chat._generate_stream_content = _reject_content
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+        )
+
+        chunks = self._run_chat_stream(Mock(), req)
+
+        self.assertTrue(stream_closed)
+        self.assertIn("malformed tool protocol", chunks[-2])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

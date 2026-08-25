@@ -36,6 +36,7 @@ class _FakeOpenAIServingChat:
 
     def __init__(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
         self.stream_lines = stream_lines or []
+        self.stream_closed = False
         self.apply_reasoning_calls: list[bool] = []
         self.chat_encoding_spec = chat_encoding_spec
         self.tokenizer_manager = SimpleNamespace(
@@ -47,10 +48,13 @@ class _FakeOpenAIServingChat:
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
-            for line in self.stream_lines:
-                if isinstance(line, BaseException):
-                    raise line
-                yield line
+            try:
+                for line in self.stream_lines:
+                    if isinstance(line, BaseException):
+                        raise line
+                    yield line
+            finally:
+                self.stream_closed = True
 
         return _gen()
 
@@ -793,7 +797,187 @@ class TestAnthropicServing(unittest.TestCase):
             [event["type"] for event in events],
             ["message_start", "error", "message_stop"],
         )
+        self.assertTrue(serving.openai_serving_chat.stream_closed)
         self.assertEqual(events[1]["error"]["type"], "api_error")
+
+    def test_stream_client_close_closes_nested_openai_stream(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"content": "first"})]),
+                _chunk([_choice({"content": "never consumed"})]),
+            ]
+        )
+
+        async def _consume_one_then_close():
+            stream = serving._generate_anthropic_stream(
+                adapted_request=object(),
+                processed_request=object(),
+                anthropic_request=self._anthropic_request(),
+                raw_request=object(),
+            )
+            await stream.__anext__()
+            await stream.aclose()
+
+        asyncio.run(_consume_one_then_close())
+
+        self.assertTrue(serving.openai_serving_chat.stream_closed)
+
+    def test_stream_parser_error_after_tool_name_does_not_publish_empty_tool(self):
+        """A rejected invoke must not leave a tool_use block on the wire."""
+        upstream_error = {
+            "error": {
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            }
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(
+                event["type"] == "content_block_start"
+                and event["content_block"]["type"] == "tool_use"
+                for event in events
+            )
+        )
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_stream_invalid_buffered_tool_json_fails_before_tool_start(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_json",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_stream_tool_call_is_committed_after_terminal_finish(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_good",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ':"sglang"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "lookup")
+        argument_parts = [
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        ]
+        self.assertEqual("".join(argument_parts), '{"query":"sglang"}')
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
 
     def test_cache_read_exceeds_prompt_tokens_clamps_to_zero(self):
         """When cached_tokens > prompt_tokens, input_tokens clamps to 0 instead of going negative."""

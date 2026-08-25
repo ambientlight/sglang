@@ -239,16 +239,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     e,
                 )
 
-        # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
+        # Explicit request values still win in ``to_sampling_params``. For
+        # omitted values, operator-provided preferred parameters must outrank
+        # generation_config.json; otherwise an API adapter materializes the
+        # model defaults first and TokenizerManager can no longer tell that the
+        # caller omitted them.
+        model_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
+        preferred_sampling_params = getattr(
+            self.tokenizer_manager, "preferred_sampling_params", None
+        )
+        self.default_sampling_params = dict(model_sampling_params or {})
+        if isinstance(preferred_sampling_params, dict):
+            self.default_sampling_params.update(preferred_sampling_params)
         if (
             self.default_sampling_params
             and not OpenAIServingChat._default_sampling_params_logged
         ):
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                "Using effective default chat sampling params: "
+                f"{self.default_sampling_params}",
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
@@ -1242,7 +1253,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tool_choice == "none":
+                # A disabled tool must not remain in either request-level or
+                # message-level DSV metadata: these custom encoders otherwise
+                # teach the model to emit DSML while output parsing is disabled.
+                for message in messages:
+                    message.pop("tools", None)
+            elif request.tools:
                 # exclude_unset keeps protocol-model defaults (e.g. strict=False)
                 # out of the rendered tool schemas so the prompt matches the
                 # checkpoint's reference encoding exactly.
@@ -1536,15 +1553,16 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
 
         stream_started = False
+        generation_stream = self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        )
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in generation_stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -1774,6 +1792,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Parsing and adapter failures can terminate this loop while the
+            # scheduler is still decoding.  Explicitly close the tokenizer
+            # stream so its ownership cleanup dispatches AbortReq immediately;
+            # relying on async-generator finalization left long generations
+            # orphaned and produced repeated "state was deleted" warnings.
+            await generation_stream.aclose()
 
         yield "data: [DONE]\n\n"
 

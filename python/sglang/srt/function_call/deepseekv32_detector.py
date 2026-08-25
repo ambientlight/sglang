@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 _GENERIC_INVOKE_RE = re.compile(
     r'^[ \t]*<invoke\s+name="(?P<name>[^"]+)"\s*>', re.MULTILINE
 )
+_DSML_TAG_PREFIX_RE = re.compile(r"</?｜DSML｜")
+_DSML_TAG_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_DSML_INVOKE_OPEN_RE = re.compile(r'<｜DSML｜invoke\s+name="[^"<>\r\n]+"\s*(?:>|/>)')
 
 
 def find_malformed_generic_tool_call(
@@ -105,6 +108,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         "</｜DSML｜function_calls",
     ]
     _GENERIC_INVOKE_PREFIX = "<invoke"
+    _KNOWN_DSML_TAG_NAMES = frozenset(
+        {"tool_calls", "function_calls", "invoke", "parameter"}
+    )
 
     def __init__(self):
         super().__init__()
@@ -163,6 +169,126 @@ class DeepSeekV32Detector(BaseFormatDetector):
         raise MalformedToolCallError(
             "Model emitted malformed DeepSeek tool-call protocol"
         )
+
+    @staticmethod
+    def _is_inside_dsml_invoke(text: str, offset: int) -> bool:
+        """Return whether *offset* is inside a valid unclosed invoke payload.
+
+        Tool arguments are opaque user/model data and may legitimately contain
+        strings that look like DSML examples.  The fail-closed check below is
+        therefore limited to the normal-text/protocol layer around invokes.  A
+        malformed ``<...invoke`` prefix must not establish that protection or it
+        could hide every later degenerate marker in the turn.
+        """
+        last_open = -1
+        for match in _DSML_INVOKE_OPEN_RE.finditer(text, 0, offset):
+            if not match.group(0).endswith("/>"):
+                last_open = match.start()
+        last_close = text.rfind("</｜DSML｜invoke", 0, offset)
+        return last_open > last_close
+
+    @staticmethod
+    def _is_valid_complete_dsml_tag(
+        tag: str, tag_name: str, expected_wrapper: str
+    ) -> bool:
+        """Validate protocol control tags once their closing ``>`` arrives."""
+        if tag_name in {"tool_calls", "function_calls"}:
+            return bool(
+                re.fullmatch(rf"</?｜DSML｜{re.escape(expected_wrapper)}\s*>", tag)
+            )
+        if tag_name == "invoke":
+            if tag.startswith("</"):
+                return bool(re.fullmatch(r"</｜DSML｜invoke\s*>", tag))
+            return bool(re.fullmatch(_DSML_INVOKE_OPEN_RE, tag))
+        # Parameter tags can be ordinary explanatory text outside an invoke.
+        # Inside a valid invoke they are opaque argument syntax and are skipped
+        # before this helper is called.
+        return tag_name == "parameter"
+
+    def _reject_malformed_reserved_dsml_tag(self, text: str) -> None:
+        """Reject tag-shaped use of the reserved DSML namespace.
+
+        The model sometimes degenerates into non-protocol markers such as
+        ``</｜DSML｜tool_api_call...`` or ``<｜DSML｜tool_crossing``.  Those
+        markers are neither ordinary response text nor valid tool calls.  Letting
+        them through makes clients ingest raw protocol and often amplifies the
+        broken turn in subsequent prompts.
+
+        Known DSML parameter tags remain valid as explanatory text, and markers
+        inside an invoke payload are left untouched as tool argument data.
+        """
+        for marker in _DSML_TAG_PREFIX_RE.finditer(text):
+            if self._is_inside_dsml_invoke(text, marker.start()):
+                continue
+
+            tail = text[marker.end() :]
+            if not tail:
+                # A complete tag name may arrive in the next stream chunk.
+                continue
+
+            name_match = _DSML_TAG_NAME_RE.match(tail)
+            if name_match is None:
+                malformed = True
+                tag_name = tail[:32]
+            else:
+                tag_name = name_match.group(0)
+                next_char = tail[name_match.end() : name_match.end() + 1]
+                expected_wrapper = (
+                    "tool_calls" if "tool_calls" in self.bot_token else "function_calls"
+                )
+                if tag_name in {"tool_calls", "function_calls"} and (
+                    tag_name != expected_wrapper
+                ):
+                    # V4 and V3.2 use different wrapper names. The alternate
+                    # wrapper is reserved protocol, but is not valid for this
+                    # detector and must not become response text.
+                    malformed = True
+                elif tag_name in self._KNOWN_DSML_TAG_NAMES:
+                    # A known name must end at an XML-like boundary.  This also
+                    # catches a valid-looking prefix followed by degenerate text.
+                    malformed = bool(
+                        next_char and not (next_char.isspace() or next_char in ">/")
+                    )
+                elif not next_char and any(
+                    known.startswith(tag_name) for known in self._KNOWN_DSML_TAG_NAMES
+                ):
+                    # Hold an incomplete known tag such as ``tool_`` until the
+                    # next chunk decides whether it becomes ``tool_calls``.
+                    malformed = False
+                else:
+                    malformed = True
+
+                if not malformed and tag_name != "parameter":
+                    tag_end = text.find(">", marker.end())
+                    nested_tag = text.find("<", marker.end())
+                    if nested_tag != -1 and (tag_end == -1 or nested_tag < tag_end):
+                        # A second tag began before this control tag closed.
+                        # This is the exact v7 ``<tool_calls <invoke...`` and
+                        # ``<invoke name=\"... <parameter...`` degeneration.
+                        malformed = True
+                    elif tag_end != -1:
+                        malformed = not self._is_valid_complete_dsml_tag(
+                            text[marker.start() : tag_end + 1],
+                            tag_name,
+                            expected_wrapper,
+                        )
+                    elif tag_name in {"tool_calls", "function_calls"}:
+                        # An incomplete wrapper may contain only padding while
+                        # waiting for ``>``. Any other suffix is already invalid.
+                        malformed = bool(tail[name_match.end() :].strip())
+
+            if not malformed:
+                continue
+
+            logger.warning(
+                "DeepSeek output used malformed reserved DSML tag %r at "
+                "character %d",
+                tag_name,
+                marker.start(),
+            )
+            raise MalformedToolCallError(
+                "Model emitted malformed DeepSeek tool-call protocol"
+            )
 
     @classmethod
     def _ends_with_partial_tool_tag(cls, text: str) -> bool:
@@ -276,6 +402,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
         self._reject_malformed_generic_tool_call(text, tools)
+        self._reject_malformed_reserved_dsml_tag(text)
         idx = text.find(self.bot_token)
         normal_text = self._trim_tool_boundary_prefix(text[:idx]) if idx != -1 else text
         if self.bot_token not in text:
@@ -319,6 +446,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
         self._reject_malformed_generic_tool_call(current_text, tools)
+        self._reject_malformed_reserved_dsml_tag(current_text)
 
         # Check if buffer contains any DSML tool-call markers or ends with a
         # partial tag prefix.  Use specific tool-call tags instead of bare
@@ -556,6 +684,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult()
         buffered = self._buffer
         self._buffer = ""
+        stripped = buffered.rstrip()
+        last_lt = stripped.rfind("<")
+        trailing_tag = stripped[last_lt:] if last_lt != -1 else ""
+        if trailing_tag.startswith(("<｜DSML", "</｜DSML")) and ">" not in trailing_tag:
+            logger.warning(
+                "Dropping incomplete reserved DSML tool-call tag at stream end"
+            )
+            buffered = buffered[:last_lt]
         # If we successfully parsed tool calls, the buffer holds only
         # trailing whitespace or closing tags — don't emit those.
         if self.current_tool_id != -1 and self.prev_tool_call_arr:

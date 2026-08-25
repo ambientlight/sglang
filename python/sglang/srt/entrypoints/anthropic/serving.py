@@ -104,6 +104,21 @@ _THINKING_SIGNATURE_AAD = b"sglang-anthropic-thinking-v1"
 _MAX_SEALED_THINKING_BYTES = 8 * 1024 * 1024
 
 
+@dataclass
+class _PendingAnthropicToolCall:
+    """One tool call held until the upstream parser completes the turn.
+
+    Anthropic clients incrementally parse ``input_json_delta``.  Once a
+    ``tool_use`` block is on the wire it cannot be retracted if the model later
+    emits malformed protocol.  Holding only the tool-call portion keeps normal
+    reasoning/text streaming live while making tool publication transactional.
+    """
+
+    id: str
+    name: str
+    argument_parts: list[str]
+
+
 class _ThinkingSignatureCodec:
     """Seal hidden reasoning into an authenticated, stateless continuation token.
 
@@ -130,7 +145,7 @@ class _ThinkingSignatureCodec:
         return self._key_id
 
     @classmethod
-    def from_environment(cls) -> Optional["_ThinkingSignatureCodec"]:
+    def from_environment(cls) -> Optional[_ThinkingSignatureCodec]:
         key_path_value = os.environ.get(_THINKING_KEY_FILE_ENV)
         if not key_path_value:
             return None
@@ -1192,10 +1207,61 @@ class AnthropicServing:
         anthropic_request: AnthropicMessagesRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
-        """Convert OpenAI chat stream to Anthropic event stream."""
+        """Own both adapter layers for the full lifetime of the HTTP stream."""
         openai_stream = self.openai_serving_chat._generate_chat_stream(
             adapted_request, processed_request, raw_request
         )
+        translation_stream = self._translate_openai_stream(
+            openai_stream,
+            anthropic_request,
+        )
+        try:
+            async for frame in translation_stream:
+                yield frame
+        finally:
+            # Client disconnects close this outer generator directly.  Close
+            # both nested generators here as well as on their explicit error
+            # paths so ownership never depends on async-generator GC.
+            await translation_stream.aclose()
+            close = getattr(openai_stream, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to close child OpenAI generation stream")
+
+    async def _translate_openai_stream(
+        self,
+        openai_stream,
+        anthropic_request: AnthropicMessagesRequest,
+    ) -> AsyncGenerator[str, None]:
+        """Convert OpenAI chat stream to Anthropic event stream."""
+        upstream_closed = False
+
+        async def _close_openai_stream() -> None:
+            """Deterministically release the child OpenAI generation stream.
+
+            This adapter frequently terminates after translating an upstream
+            error into an Anthropic SSE error.  Returning while the child async
+            generator is suspended on its error chunk delays its ``finally``
+            cleanup until garbage collection, which can leave scheduler work
+            decoding after the Messages response has already ended.
+            """
+            nonlocal upstream_closed
+            if upstream_closed:
+                return
+            upstream_closed = True
+            close = getattr(openai_stream, "aclose", None)
+            if close is None:
+                return
+            try:
+                await close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to close child OpenAI generation stream")
 
         content_block_index = 0
         content_block_open = False
@@ -1205,6 +1271,10 @@ class AnthropicServing:
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
+        pending_tool_calls: dict[int, _PendingAnthropicToolCall] = {}
+        active_tool_call_index: Optional[int] = None
+        next_tool_call_index = 0
+        deferred_text_after_tool: list[str] = []
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
         omit_thinking = bool(
@@ -1328,6 +1398,79 @@ class AnthropicServing:
             frames.append(_emit(MessageStopEvent()))
             return frames
 
+        def _commit_pending_tool_events() -> list[AnthropicStreamEvent]:
+            """Validate and atomically publish all buffered tool calls.
+
+            The OpenAI-side DeepSeek parser emits a tool name before it knows
+            whether the complete invoke is valid.  Buffering through the final
+            ``tool_calls`` finish reason prevents a later parser rejection from
+            leaving Claude/Anthropic clients with an empty or partial tool block.
+            """
+            nonlocal had_content_delta
+
+            validated: list[_PendingAnthropicToolCall] = []
+            for pending in pending_tool_calls.values():
+                arguments = "".join(pending.argument_parts)
+                if arguments:
+                    try:
+                        parsed_arguments = json.loads(arguments)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        raise MalformedToolCallError(
+                            "Model emitted malformed tool-call arguments"
+                        ) from e
+                    if not isinstance(parsed_arguments, dict):
+                        raise MalformedToolCallError(
+                            "Model emitted non-object tool-call arguments"
+                        )
+                validated.append(pending)
+
+            events: list[AnthropicStreamEvent] = []
+            for pending in validated:
+                events.extend(
+                    _ensure_content_block_events(
+                        "tool_use",
+                        ToolUseBlock(
+                            id=pending.id,
+                            name=pending.name,
+                            input={},
+                        ),
+                        force_new=True,
+                    )
+                )
+                for part in pending.argument_parts:
+                    if part:
+                        events.append(
+                            ContentBlockDeltaEvent(
+                                index=content_block_index,
+                                delta=InputJsonDelta(partial_json=part),
+                            )
+                        )
+                events.extend(_close_content_block_events())
+                had_content_delta = True
+
+            # Tool calls are terminal in normal Messages responses.  Preserve
+            # the legacy adapter's ordering for unusual tool-then-text streams,
+            # but defer that text with the transaction so a parser error cannot
+            # publish content past an uncommitted tool call.
+            for text_part in deferred_text_after_tool:
+                events.extend(
+                    _ensure_content_block_events(
+                        "text",
+                        TextBlock(text=""),
+                    )
+                )
+                events.append(
+                    ContentBlockDeltaEvent(
+                        index=content_block_index,
+                        delta=TextDelta(text=text_part),
+                    )
+                )
+                had_content_delta = True
+
+            pending_tool_calls.clear()
+            deferred_text_after_tool.clear()
+            return events
+
         def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
             """Detect an OpenAI handler streaming-error envelope.
 
@@ -1365,6 +1508,7 @@ class AnthropicServing:
             stream_iter = openai_stream.__aiter__()
         except Exception as e:
             logger.exception("Failed to open OpenAI stream: %s", e)
+            await _close_openai_stream()
             for frame in _flush_on_error("api_error", "Internal server error"):
                 yield frame
             return
@@ -1375,9 +1519,11 @@ class AnthropicServing:
             except StopAsyncIteration:
                 break
             except asyncio.CancelledError:
+                await _close_openai_stream()
                 raise
             except MalformedToolCallError as e:
                 logger.warning("Malformed DeepSeek tool-call output: %s", e)
+                await _close_openai_stream()
                 for frame in _flush_on_error("api_error", str(e)):
                     yield frame
                 return
@@ -1387,6 +1533,7 @@ class AnthropicServing:
                 # proper Anthropic error event rather than aborting the
                 # StreamingResponse generator.
                 logger.warning("OpenAI stream raised before first chunk: %s", e)
+                await _close_openai_stream()
                 for frame in _flush_on_error(
                     "invalid_request_error", str(e) or "Request failed"
                 ):
@@ -1394,6 +1541,7 @@ class AnthropicServing:
                 return
             except Exception as e:
                 logger.exception("OpenAI stream raised mid-flight: %s", e)
+                await _close_openai_stream()
                 for frame in _flush_on_error("api_error", "Internal server error"):
                     yield frame
                 return
@@ -1404,8 +1552,20 @@ class AnthropicServing:
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
+                await _close_openai_stream()
                 for frame in _ensure_message_started(None):
                     yield frame
+
+                if pending_tool_calls:
+                    logger.warning(
+                        "OpenAI stream ended before buffered tool calls received "
+                        "a terminal finish reason"
+                    )
+                    for frame in _flush_on_error(
+                        "api_error", "Incomplete tool-call stream"
+                    ):
+                        yield frame
+                    return
 
                 # No content AND no finish_reason: the backend dropped the
                 # stream silently. Surface as api_error so clients see the
@@ -1423,7 +1583,7 @@ class AnthropicServing:
                         _build_error_event("api_error", "Backend produced no content")
                     )
                     yield _emit(MessageStopEvent())
-                    continue
+                    return
 
                 # Close any open content block
                 for event in _close_content_block_events():
@@ -1445,7 +1605,7 @@ class AnthropicServing:
                 )
 
                 yield _emit(MessageStopEvent())
-                continue
+                return
 
             # Parse the OpenAI chunk
             try:
@@ -1465,6 +1625,7 @@ class AnthropicServing:
                         error_type,
                         error_message,
                     )
+                    await _close_openai_stream()
                     for frame in _flush_on_error(error_type, error_message):
                         yield frame
                     return
@@ -1474,6 +1635,7 @@ class AnthropicServing:
                     type(e).__name__,
                     data_str[:200],
                 )
+                await _close_openai_stream()
                 for frame in _flush_on_error("api_error", "Stream processing error"):
                     yield frame
                 return
@@ -1553,77 +1715,132 @@ class AnthropicServing:
 
             # Handle tool call deltas
             if delta.tool_calls:
+                if deferred_text_after_tool:
+                    logger.warning(
+                        "Tool-call delta arrived after text following an "
+                        "uncommitted tool call; failing Anthropic stream closed"
+                    )
+                    await _close_openai_stream()
+                    for frame in _flush_on_error(
+                        "api_error", "Invalid tool-call stream ordering"
+                    ):
+                        yield frame
+                    return
+                tool_stream_error: Optional[str] = None
                 for tc in delta.tool_calls:
                     tc_id = tc.id
                     tc_func = tc.function
+                    raw_arguments = tc_func.arguments if tc_func else None
+                    if isinstance(raw_arguments, dict):
+                        argument_part: Optional[str] = json.dumps(
+                            raw_arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    elif raw_arguments is None:
+                        argument_part = None
+                    else:
+                        argument_part = str(raw_arguments)
 
-                    # New tool call: always close the previous block (even if
-                    # it was also tool_use — each tool needs its own index)
-                    # and start a fresh one.
                     if tc_func and tc_func.name:
-                        for event in _ensure_content_block_events(
-                            "tool_use",
-                            ToolUseBlock(
+                        if tc.index is None:
+                            tool_index = next_tool_call_index
+                            next_tool_call_index += 1
+                        else:
+                            tool_index = tc.index
+                            next_tool_call_index = max(
+                                next_tool_call_index, tool_index + 1
+                            )
+                        pending = pending_tool_calls.get(tool_index)
+                        if pending is None:
+                            pending = _PendingAnthropicToolCall(
                                 id=tc_id or f"toolu_{uuid.uuid4().hex}",
                                 name=tc_func.name,
-                                input={},
-                            ),
-                            force_new=True,
-                        ):
-                            yield _emit(event)
-                        # A zero-argument tool call may never emit an
-                        # input_json_delta; the tool_use start block itself is
-                        # still meaningful content because it carries id/name.
-                        had_content_delta = True
+                                argument_parts=[],
+                            )
+                            pending_tool_calls[tool_index] = pending
+                        elif pending.name != tc_func.name:
+                            tool_stream_error = "Conflicting tool-call stream index"
+                            break
+                        elif tc_id:
+                            pending.id = tc_id
+                        active_tool_call_index = tool_index
+                        if argument_part:
+                            pending.argument_parts.append(argument_part)
 
-                        if tc_func.arguments:
-                            yield _emit(
-                                ContentBlockDeltaEvent(
-                                    index=content_block_index,
-                                    delta=InputJsonDelta(
-                                        partial_json=tc_func.arguments,
-                                    ),
-                                )
-                            )
-                            had_content_delta = True
-
-                    elif tc_func and tc_func.arguments:
-                        # Continuing arguments for current tool call
-                        if content_block_type != "tool_use":
-                            logger.warning(
-                                "Tool-call argument delta arrived with no open "
-                                "tool_use block; failing the Anthropic stream closed"
-                            )
-                            for frame in _flush_on_error(
-                                "api_error", "Invalid tool-call stream ordering"
-                            ):
-                                yield frame
-                            return
-                        yield _emit(
-                            ContentBlockDeltaEvent(
-                                index=content_block_index,
-                                delta=InputJsonDelta(
-                                    partial_json=tc_func.arguments,
-                                ),
-                            )
+                    elif argument_part:
+                        tool_index = (
+                            tc.index if tc.index is not None else active_tool_call_index
                         )
-                        had_content_delta = True
+                        pending = (
+                            pending_tool_calls.get(tool_index)
+                            if tool_index is not None
+                            else None
+                        )
+                        if pending is None:
+                            tool_stream_error = "Invalid tool-call stream ordering"
+                            break
+                        pending.argument_parts.append(argument_part)
+
+                if tool_stream_error is not None:
+                    logger.warning(
+                        "%s; failing Anthropic stream closed", tool_stream_error
+                    )
+                    await _close_openai_stream()
+                    for frame in _flush_on_error("api_error", tool_stream_error):
+                        yield frame
+                    return
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
-                for event in _ensure_content_block_events(
-                    "text",
-                    TextBlock(text=""),
-                ):
-                    yield _emit(event)
+                if pending_tool_calls:
+                    deferred_text_after_tool.append(delta.content)
+                else:
+                    for event in _ensure_content_block_events(
+                        "text",
+                        TextBlock(text=""),
+                    ):
+                        yield _emit(event)
 
-                yield _emit(
-                    ContentBlockDeltaEvent(
-                        index=content_block_index,
-                        delta=TextDelta(text=delta.content),
+                    yield _emit(
+                        ContentBlockDeltaEvent(
+                            index=content_block_index,
+                            delta=TextDelta(text=delta.content),
+                        )
                     )
-                )
-                had_content_delta = True
+                    had_content_delta = True
+
+            if choice.finish_reason is not None and pending_tool_calls:
+                if choice.finish_reason not in {"stop", "tool_calls"}:
+                    logger.warning(
+                        "Tool-call stream terminated with finish_reason=%r",
+                        choice.finish_reason,
+                    )
+                    await _close_openai_stream()
+                    for frame in _flush_on_error(
+                        "api_error", "Incomplete tool-call stream"
+                    ):
+                        yield frame
+                    return
+                try:
+                    pending_events = _commit_pending_tool_events()
+                except MalformedToolCallError as e:
+                    logger.warning("Rejecting buffered Anthropic tool call: %s", e)
+                    await _close_openai_stream()
+                    for frame in _flush_on_error("api_error", str(e)):
+                        yield frame
+                    return
+                for event in pending_events:
+                    yield _emit(event)
+                # Match OpenAI's normal conversion: a natural stop after a
+                # parsed tool call is surfaced as Anthropic ``tool_use``.
+                if finish_reason == "stop":
+                    finish_reason = "tool_calls"
+
+        await _close_openai_stream()
+        logger.warning("OpenAI stream ended without a terminal [DONE] event")
+        for frame in _flush_on_error("api_error", "Incomplete upstream stream"):
+            yield frame
 
     def _convert_response(
         self,
