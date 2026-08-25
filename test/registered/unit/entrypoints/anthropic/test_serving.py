@@ -911,6 +911,103 @@ class TestAnthropicServing(unittest.TestCase):
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("malformed tool-call arguments", error["error"]["message"])
 
+    def test_stream_invalid_buffered_tool_json_does_not_release_trailing_text(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_json_with_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "<tooladapter>corrupt"})]),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("corrupt", json.dumps(events))
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_stream_tool_text_then_second_tool_fails_before_publication(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_before_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":"first"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "<tool_use_error>corrupt"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_after_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("corrupt", json.dumps(events))
+        error = next(event for event in events if event["type"] == "error")
+        self.assertEqual(error["error"]["message"], "Invalid tool-call stream ordering")
+
     def test_stream_tool_call_is_committed_after_terminal_finish(self):
         serving = self._serving(
             [
