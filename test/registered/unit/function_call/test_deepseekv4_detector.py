@@ -113,7 +113,74 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         text = "Prose.\n" + _weather_call()
         normal, _ = self._feed([text[i : i + 4] for i in range(0, len(text), 4)])
 
+        # A structural newline may arrive before the closing wrapper, but the
+        # ordinary prose itself must appear exactly once.
+        self.assertEqual(normal.rstrip(), "Prose.")
         self.assertNotIn(DSML, normal)
+
+    def test_capture_derived_incomplete_invoke_does_not_replay_preamble(self):
+        """A buffered incomplete invoke must not replay its preamble for every
+        subsequent token. The capture emitted the same prefix twelve times."""
+        detector = DeepSeekV4Detector()
+        preamble = "Preparing the command.\n"
+        opening = (
+            preamble
+            + f"<{DSML}tool_calls>\n"
+            + f'<{DSML}invoke name="get_weather">\n'
+            + f'<{DSML}parameter name="city" string="true">N'
+        )
+
+        results = [detector.parse_streaming_increment(opening, self.tools)]
+        results.extend(
+            detector.parse_streaming_increment("x", self.tools) for _ in range(11)
+        )
+
+        self.assertEqual("".join(result.normal_text for result in results), preamble)
+        self.assertEqual(
+            sum(bool(result.normal_text) for result in results),
+            1,
+        )
+        self.assertEqual(results[0].normal_text, preamble)
+        self.assertTrue(all(not result.normal_text for result in results[1:]))
+        self.assertEqual(
+            [call.name for result in results for call in result.calls if call.name],
+            ["get_weather"],
+        )
+        continuations = [call for result in results[1:] for call in result.calls]
+        self.assertTrue(continuations)
+        self.assertTrue(all(call.name is None for call in continuations))
+        self.assertNotIn(preamble, detector._buffer)
+
+    def test_inter_call_text_before_partial_invoke_is_emitted_once(self):
+        """The consume-once rule also applies to prose before a later call."""
+        detector = DeepSeekV4Detector()
+        inter_call_text = "Checking another city.\n"
+        second_call_start = (
+            f"<{DSML}tool_calls>\n"
+            f'<{DSML}invoke name="get_weather">\n'
+            f'<{DSML}parameter name="city" string="true">N'
+        )
+        first = detector.parse_streaming_increment(
+            _weather_call("SF") + "\n" + inter_call_text + second_call_start,
+            self.tools,
+        )
+        retries = [
+            detector.parse_streaming_increment(chunk, self.tools)
+            for chunk in ("e", "w", " ", "Y", "o", "r", "k")
+        ]
+        final = detector.parse_streaming_increment(
+            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>",
+            self.tools,
+        )
+        results = [first, *retries, final]
+
+        self.assertEqual(
+            "".join(result.normal_text for result in results), inter_call_text
+        )
+        self.assertEqual(
+            [call.name for result in results for call in result.calls if call.name],
+            ["get_weather", "get_weather"],
+        )
 
     def test_malformed_partial_json_falls_back_to_raw_value(self):
         """A partial non-string parameter must not escape as MalformedJSON."""
@@ -140,23 +207,28 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         normal_text so the tool-call text is neither swallowed permanently
         nor duplicated across deltas."""
         detector = DeepSeekV4Detector()
+        preamble = "Let me check.\n"
 
         with patch.object(
             DeepSeekV4Detector,
             "_parse_parameters_from_xml",
             side_effect=RuntimeError("boom"),
         ):
-            first = detector.parse_streaming_increment(_weather_call(), self.tools)
+            first = detector.parse_streaming_increment(
+                preamble + _weather_call(), self.tools
+            )
             # Buffer is retained for retry — NOT cleared
             self.assertNotEqual(detector._buffer, "")
+            self.assertNotIn(preamble, detector._buffer)
 
         # Mock removed — the retained buffer should now parse successfully
         # on the next delta, proving the retry works.
         second = detector.parse_streaming_increment(" tail", self.tools)
 
-        # _weather_call() has no preamble, so first.normal_text is empty.
+        self.assertEqual(first.normal_text, preamble)
         self.assertEqual(first.calls, [])
         # The tool call is emitted as a call, NOT as normal_text
+        self.assertNotIn(preamble, second.normal_text)
         self.assertNotIn("get_weather", second.normal_text)
         self.assertTrue(any(c.name == "get_weather" for c in second.calls))
 

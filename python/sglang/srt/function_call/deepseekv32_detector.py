@@ -395,14 +395,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
-                    # Same trailing-newline trim as detect_and_parse, so both agree.
-                    append_normal_text(normal_prefix(call_start))
-                else:
-                    append_normal_text(normal_prefix(invoke_match.start()))
+
+                call_start = invoke_match.start()
+                bot_pos = current_text.rfind(self.bot_token, 0, call_start)
+                if bot_pos != -1:
+                    call_start = bot_pos
+                # Same trailing-newline trim as detect_and_parse, so both agree.
+                append_normal_text(normal_prefix(call_start))
+
+                # An incomplete invoke remains buffered and is reparsed for every
+                # subsequent stream chunk.  Drop the ordinary prefix as soon as it
+                # has been emitted, while retaining the DSML wrapper/invoke, so the
+                # same preamble or inter-call text cannot be replayed on each retry.
+                self._buffer = current_text[call_start:]
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
