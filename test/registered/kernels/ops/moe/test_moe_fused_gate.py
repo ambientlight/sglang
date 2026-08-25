@@ -271,6 +271,39 @@ def test_moe_fused_gate_shapes_and_dtypes() -> None:
     )
 
 
+def test_moe_fused_gate_sqrtsoftplus_extreme_logits() -> None:
+    """Extreme DSV4 logits must not flush routing weights to zero or NaN."""
+    num_experts, topk = 128, 6
+    scores = (
+        torch.tensor([-25.0, -16.7, 100.0], dtype=torch.float32, device=DEVICE)
+        .unsqueeze(1)
+        .expand(-1, num_experts)
+        .contiguous()
+    )
+    # Make the selected experts deterministic while leaving their un-biased
+    # routing weights equal within each row.
+    bias = torch.linspace(0.0, -1.0, num_experts, device=DEVICE)
+    kwargs = dict(
+        topk=topk,
+        scoring_func="sqrtsoftplus",
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    ref_w, ref_i = _reference_gate(scores, bias, **kwargs)
+    for implementation in (moe_fused_gate, moe_fused_gate_jit):
+        actual_w, actual_i = implementation(scores, bias, **kwargs)
+        torch.cuda.synchronize()
+        assert torch.isfinite(actual_w).all()
+        torch.testing.assert_close(
+            _scatter_by_expert(actual_w, actual_i, num_experts),
+            _scatter_by_expert(ref_w, ref_i, num_experts),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+
 def _reference_softmax(
     gating: torch.Tensor, topk: int, renormalize: bool
 ) -> Tuple[torch.Tensor, torch.Tensor]:

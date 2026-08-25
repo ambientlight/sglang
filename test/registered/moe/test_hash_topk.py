@@ -100,6 +100,27 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.router_logits.shape == (0, 6)
 
 
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+def test_hash_topk_all_underflowed_scores_remain_finite(
+    num_fused_shared_experts: int,
+):
+    topk = HashTopK(
+        topk=3,
+        num_experts=4,
+        num_fused_shared_experts=num_fused_shared_experts,
+        vocab_size=2,
+        scoring_func="sqrtsoftplus",
+    )
+
+    weights, _ = topk._forward_torch(
+        router_logits=torch.full((2, 4), -200.0),
+        input_ids=torch.tensor([0, 1], dtype=torch.int64),
+    )
+
+    assert torch.isfinite(weights).all()
+    assert torch.count_nonzero(weights) == 0
+
+
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():
     captured = {}
 
