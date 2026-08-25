@@ -277,7 +277,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._reject_malformed_generic_tool_call(text, tools)
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
+        normal_text = self._trim_tool_boundary_prefix(text[:idx]) if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -339,6 +339,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             and not potentially_dsml
             and not ends_with_prefix
         ):
+            # A standalone whitespace token is ambiguous: it can be ordinary
+            # response text, or structural padding immediately before/after a
+            # DSML tool-call delimiter.  Hold it until the next chunk resolves
+            # that ambiguity.  ``finish`` flushes it for a non-tool response,
+            # while a confirmed tool call consumes it as wrapper structure.
+            if current_text and current_text.isspace():
+                return StreamingParseResult()
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
@@ -369,7 +376,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 prefix = prefix.replace(token, "")
             if self.eot_token in current_text[:end]:
                 prefix = prefix.lstrip("\n")
-            return prefix.removesuffix("\n\n")
+            return self._trim_tool_boundary_prefix(prefix)
 
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -498,8 +505,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 and not self._ends_with_partial_tool_tag(postamble)
                 and not self._ends_with_partial_generic_invoke(postamble)
             ):
-                append_normal_text(postamble)
-                self._buffer = ""
+                if (
+                    postamble.isspace()
+                    and self.current_tool_id != -1
+                    and self.prev_tool_call_arr
+                ):
+                    # A newline between ``</invoke>`` and the closing tool-call
+                    # wrapper may arrive as its own token.  Keep it buffered so
+                    # the wrapper consumes it instead of exposing an empty text
+                    # block to OpenAI/Anthropic clients.
+                    self._buffer = "" if had_wrapper_end else postamble
+                else:
+                    append_normal_text(postamble)
+                    self._buffer = ""
 
             return StreamingParseResult(
                 normal_text="".join(normal_text_parts),
@@ -553,6 +571,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 earliest = idx
         buffered = buffered[:earliest]
         return StreamingParseResult(normal_text=buffered)
+
+    @staticmethod
+    def _trim_tool_boundary_prefix(text: str) -> str:
+        """Remove structural padding before a tool call without losing prose."""
+        text = text.removesuffix("\n\n")
+        return "" if text and text.isspace() else text
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

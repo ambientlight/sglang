@@ -36,7 +36,7 @@ def _generic_weather_call(*, mixed: bool = False) -> str:
         return (
             '<invoke name="get_weather">\n'
             f'{_param("city", "true", "SF")}\n'
-            f'</{DSML}invoke>\n</{DSML}tool_calls>'
+            f"</{DSML}invoke>\n</{DSML}tool_calls>"
         )
     return (
         '<invoke name="get_weather">\n'
@@ -117,6 +117,57 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         # ordinary prose itself must appear exactly once.
         self.assertEqual(normal.rstrip(), "Prose.")
         self.assertNotIn(DSML, normal)
+
+    def test_split_structural_whitespace_is_not_emitted_as_text(self):
+        """Captured token boundaries put newlines before the wrapper, between
+        consecutive invokes, and between ``</invoke>`` and ``</tool_calls>``.
+        None of those delimiters may become a whitespace-only content block.
+        """
+        detector = DeepSeekV4Detector()
+        chunks = [
+            "\n\n",
+            f"<{DSML}tool_calls>\n"
+            + _invoke("get_weather", _param("city", "true", "SF")),
+            "\n",
+            _invoke("get_weather", _param("city", "true", "NY")),
+            "\n",
+            f"</{DSML}tool_calls>",
+        ]
+
+        results = [
+            detector.parse_streaming_increment(chunk, self.tools) for chunk in chunks
+        ]
+        results.append(detector.finish(self.tools))
+
+        self.assertEqual("".join(result.normal_text for result in results), "")
+        self.assertFalse(
+            any(
+                result.normal_text.isspace() for result in results if result.normal_text
+            )
+        )
+        self.assertEqual(
+            [call.name for result in results for call in result.calls if call.name],
+            ["get_weather", "get_weather"],
+        )
+
+    def test_pending_whitespace_before_plain_text_is_preserved(self):
+        """Whitespace is delayed, not globally stripped, for non-tool output."""
+        detector = DeepSeekV4Detector()
+
+        first = detector.parse_streaming_increment("\n\n", self.tools)
+        second = detector.parse_streaming_increment("Plain text", self.tools)
+
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(second.normal_text, "\n\nPlain text")
+
+    def test_pending_whitespace_only_response_is_flushed_at_end(self):
+        detector = DeepSeekV4Detector()
+
+        incremental = detector.parse_streaming_increment(" \n", self.tools)
+        terminal = detector.finish(self.tools)
+
+        self.assertEqual(incremental.normal_text, "")
+        self.assertEqual(terminal.normal_text, " \n")
 
     def test_capture_derived_incomplete_invoke_does_not_replay_preamble(self):
         """A buffered incomplete invoke must not replay its preamble for every
@@ -235,9 +286,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
     def test_capture_derived_generic_and_mixed_calls_fail_closed(self):
         """Captured generic openings are protocol drift, not normal text."""
         for mixed in (False, True):
-            with self.subTest(mixed=mixed), self.assertRaises(
-                MalformedToolCallError
-            ):
+            with self.subTest(mixed=mixed), self.assertRaises(MalformedToolCallError):
                 DeepSeekV4Detector().detect_and_parse(
                     _generic_weather_call(mixed=mixed), self.tools
                 )

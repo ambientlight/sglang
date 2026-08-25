@@ -2048,7 +2048,7 @@ class ServingChatTestCase(unittest.TestCase):
             '</｜DSML｜parameter>\n<｜DSML｜parameter name="description" '
             'string="true">Show commits ahead of'
         )
-        second = " main</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+        second = " main</｜DSML｜parameter>\n</｜DSML｜invoke>\nTool queued."
         loop = get_or_create_event_loop()
         loop.run_until_complete(collect(first))
         before_second = len(emitted)
@@ -2077,6 +2077,64 @@ class ServingChatTestCase(unittest.TestCase):
             json.loads(arguments),
             {"command": "git status", "description": "Show commits ahead of main"},
         )
+
+    def test_tool_call_structural_whitespace_is_not_streamed_as_content(self):
+        """DSML padding split into standalone tokens is protocol, not text."""
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Check weather"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        parser_dict = {}
+        has_tool_calls = {}
+        emitted = []
+
+        async def collect(delta, *, flush=False):
+            async for line in self.chat._process_tool_call_stream(
+                index=0,
+                delta=delta,
+                parser_dict=parser_dict,
+                content={"meta_info": {"id": "chatcmpl-whitespace"}},
+                request=request,
+                has_tool_calls=has_tool_calls,
+                flush=flush,
+            ):
+                emitted.append(json.loads(line[len("data: ") :]))
+
+        chunks = [
+            "\n\n",
+            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">SF'
+            "</｜DSML｜parameter>\n</｜DSML｜invoke>",
+            "\n",
+            "</｜DSML｜tool_calls>",
+        ]
+        loop = get_or_create_event_loop()
+        for chunk in chunks:
+            loop.run_until_complete(collect(chunk))
+        loop.run_until_complete(collect("", flush=True))
+
+        deltas = [chunk["choices"][0]["delta"] for chunk in emitted]
+        self.assertFalse(any(delta.get("content") for delta in deltas))
+        arguments = "".join(
+            tool_call["function"].get("arguments") or ""
+            for delta in deltas
+            for tool_call in delta.get("tool_calls") or []
+        )
+        self.assertEqual(json.loads(arguments), {"city": "SF"})
 
     def test_complete_tool_call_precedes_same_increment_postamble(self):
         """A complete invoke and its suffix preserve model-output order."""
