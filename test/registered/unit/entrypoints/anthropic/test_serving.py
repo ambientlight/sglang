@@ -315,7 +315,7 @@ class TestAnthropicServing(unittest.TestCase):
                         )
                     ]
                 ),
-                _chunk([_choice({"content": "\n"})]),
+                _chunk([_choice({"content": "between tools"})]),
                 _chunk(
                     [
                         _choice(
@@ -342,6 +342,10 @@ class TestAnthropicServing(unittest.TestCase):
         errors = [event for event in events if event["type"] == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["error"]["type"], "api_error")
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("between tools", json.dumps(events))
         self.assertNotIn("message_delta", [event["type"] for event in events])
         self.assertEqual(events[-1]["type"], "message_stop")
 
@@ -950,7 +954,7 @@ class TestAnthropicServing(unittest.TestCase):
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("malformed tool-call arguments", error["error"]["message"])
 
-    def test_stream_tool_text_then_second_tool_fails_before_publication(self):
+    def test_stream_tool_text_then_fresh_tool_preserves_order_atomically(self):
         serving = self._serving(
             [
                 _chunk(
@@ -972,7 +976,7 @@ class TestAnthropicServing(unittest.TestCase):
                         )
                     ]
                 ),
-                _chunk([_choice({"content": "<tool_use_error>corrupt"})]),
+                _chunk([_choice({"content": "Checking one more source."})]),
                 _chunk(
                     [
                         _choice(
@@ -984,7 +988,139 @@ class TestAnthropicServing(unittest.TestCase):
                                         "type": "function",
                                         "function": {
                                             "name": "lookup",
-                                            "arguments": "{}",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "type": "function",
+                                        "function": {"arguments": ':"second"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        starts = [event for event in events if event["type"] == "content_block_start"]
+        self.assertEqual(
+            [(event["index"], event["content_block"]["type"]) for event in starts],
+            [(0, "tool_use"), (1, "text"), (2, "tool_use")],
+        )
+        block_events = [
+            (
+                event["type"],
+                event["index"],
+                event.get("content_block", {}).get("type"),
+                event.get("delta", {}).get("type"),
+            )
+            for event in events
+            if event["type"].startswith("content_block")
+        ]
+        self.assertEqual(
+            block_events,
+            [
+                ("content_block_start", 0, "tool_use", None),
+                ("content_block_delta", 0, None, "input_json_delta"),
+                ("content_block_stop", 0, None, None),
+                ("content_block_start", 1, "text", None),
+                ("content_block_delta", 1, None, "text_delta"),
+                ("content_block_stop", 1, None, None),
+                ("content_block_start", 2, "tool_use", None),
+                ("content_block_delta", 2, None, "input_json_delta"),
+                ("content_block_delta", 2, None, "input_json_delta"),
+                ("content_block_stop", 2, None, None),
+            ],
+        )
+        self.assertEqual(
+            [
+                event["content_block"]["name"]
+                for event in starts
+                if event["content_block"]["type"] == "tool_use"
+            ],
+            ["lookup", "lookup"],
+        )
+        text = "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "text_delta"
+        )
+        self.assertEqual(text, "Checking one more source.")
+        arguments_by_index = {}
+        for event in events:
+            if (
+                event["type"] == "content_block_delta"
+                and event["delta"]["type"] == "input_json_delta"
+            ):
+                arguments_by_index.setdefault(event["index"], []).append(
+                    event["delta"]["partial_json"]
+                )
+        self.assertEqual(
+            {index: "".join(parts) for index, parts in arguments_by_index.items()},
+            {0: '{"query":"first"}', 2: '{"query":"second"}'},
+        )
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_stream_invalid_second_tool_after_text_releases_no_transaction(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_good_before_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":"first"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "Checking one more source."})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_bad_after_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
                                         },
                                     }
                                 ]
@@ -1004,9 +1140,9 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertFalse(
             any(event["type"] == "content_block_start" for event in events)
         )
-        self.assertNotIn("corrupt", json.dumps(events))
+        self.assertNotIn("Checking one more source.", json.dumps(events))
         error = next(event for event in events if event["type"] == "error")
-        self.assertEqual(error["error"]["message"], "Invalid tool-call stream ordering")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
 
     def test_stream_tool_call_is_committed_after_terminal_finish(self):
         serving = self._serving(
@@ -1074,6 +1210,91 @@ class TestAnthropicServing(unittest.TestCase):
                 "delta"
             ]["stop_reason"],
             "tool_use",
+        )
+
+    def test_stream_parallel_tool_argument_deltas_remain_valid(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_parallel_0",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_parallel_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ':"first"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "type": "function",
+                                        "function": {"arguments": ':"second"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        arguments_by_index = {}
+        for event in events:
+            if (
+                event["type"] == "content_block_delta"
+                and event["delta"]["type"] == "input_json_delta"
+            ):
+                arguments_by_index.setdefault(event["index"], []).append(
+                    event["delta"]["partial_json"]
+                )
+        self.assertEqual(
+            {index: "".join(parts) for index, parts in arguments_by_index.items()},
+            {0: '{"query":"first"}', 1: '{"query":"second"}'},
         )
 
     def test_cache_read_exceeds_prompt_tokens_clamps_to_zero(self):

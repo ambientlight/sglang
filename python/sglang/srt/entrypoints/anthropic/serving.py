@@ -106,17 +106,32 @@ _MAX_SEALED_THINKING_BYTES = 8 * 1024 * 1024
 
 @dataclass
 class _PendingAnthropicToolCall:
-    """One tool call held until the upstream parser completes the turn.
+    """One tool segment held until the upstream parser completes the turn.
 
     Anthropic clients incrementally parse ``input_json_delta``.  Once a
     ``tool_use`` block is on the wire it cannot be retracted if the model later
-    emits malformed protocol.  Holding only the tool-call portion keeps normal
-    reasoning/text streaming live while making tool publication transactional.
+    emits malformed protocol.  The transaction starts at the first tool call
+    and also holds any later text so mixed tool/text output can be validated and
+    published in its original block order.
     """
 
+    tool_index: int
     id: str
     name: str
     argument_parts: list[str]
+
+
+@dataclass
+class _PendingAnthropicTextSegment:
+    """Ordinary response text ordered between pending tool calls."""
+
+    parts: list[str]
+
+
+_PendingAnthropicSegment = Union[
+    _PendingAnthropicToolCall,
+    _PendingAnthropicTextSegment,
+]
 
 
 class _ThinkingSignatureCodec:
@@ -1272,9 +1287,9 @@ class AnthropicServing:
         message_started = False
         had_content_delta = False
         pending_tool_calls: dict[int, _PendingAnthropicToolCall] = {}
+        pending_segments: list[_PendingAnthropicSegment] = []
         active_tool_call_index: Optional[int] = None
         next_tool_call_index = 0
-        deferred_text_after_tool: list[str] = []
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
         omit_thinking = bool(
@@ -1398,17 +1413,52 @@ class AnthropicServing:
             frames.append(_emit(MessageStopEvent()))
             return frames
 
-        def _commit_pending_tool_events() -> list[AnthropicStreamEvent]:
-            """Validate and atomically publish all buffered tool calls.
+        def _pending_tool_has_following_text(
+            pending: _PendingAnthropicToolCall,
+        ) -> bool:
+            """Return whether text has logically closed this tool segment.
+
+            Argument chunks for parallel tools may be interleaved, so a later
+            tool segment alone does not close an earlier tool.  Once ordinary
+            text follows a tool, however, Anthropic cannot reopen that tool's
+            content block for more ``input_json_delta`` events.
+            """
+
+            seen_pending = False
+            for segment in pending_segments:
+                if segment is pending:
+                    seen_pending = True
+                elif seen_pending and isinstance(segment, _PendingAnthropicTextSegment):
+                    return True
+            return False
+
+        def _append_pending_text(text: str) -> None:
+            if pending_segments and isinstance(
+                pending_segments[-1], _PendingAnthropicTextSegment
+            ):
+                pending_segments[-1].parts.append(text)
+            else:
+                pending_segments.append(_PendingAnthropicTextSegment(parts=[text]))
+
+        def _pending_segment_kinds() -> list[str]:
+            return [
+                "text" if isinstance(segment, _PendingAnthropicTextSegment) else "tool"
+                for segment in pending_segments
+            ]
+
+        def _commit_pending_content_events() -> list[AnthropicStreamEvent]:
+            """Validate and atomically publish ordered tool/text segments.
 
             The OpenAI-side DeepSeek parser emits a tool name before it knows
             whether the complete invoke is valid.  Buffering through the final
             ``tool_calls`` finish reason prevents a later parser rejection from
             leaving Claude/Anthropic clients with an empty or partial tool block.
+            Text observed after the first tool is part of the same transaction
+            so inter-call text remains ordered without escaping before every
+            tool has passed validation.
             """
             nonlocal had_content_delta
 
-            validated: list[_PendingAnthropicToolCall] = []
             for pending in pending_tool_calls.values():
                 arguments = "".join(pending.argument_parts)
                 if arguments:
@@ -1422,10 +1472,27 @@ class AnthropicServing:
                         raise MalformedToolCallError(
                             "Model emitted non-object tool-call arguments"
                         )
-                validated.append(pending)
 
             events: list[AnthropicStreamEvent] = []
-            for pending in validated:
+            for segment in pending_segments:
+                if isinstance(segment, _PendingAnthropicTextSegment):
+                    events.extend(
+                        _ensure_content_block_events(
+                            "text",
+                            TextBlock(text=""),
+                        )
+                    )
+                    for part in segment.parts:
+                        events.append(
+                            ContentBlockDeltaEvent(
+                                index=content_block_index,
+                                delta=TextDelta(text=part),
+                            )
+                        )
+                    had_content_delta = True
+                    continue
+
+                pending = segment
                 events.extend(
                     _ensure_content_block_events(
                         "tool_use",
@@ -1448,27 +1515,8 @@ class AnthropicServing:
                 events.extend(_close_content_block_events())
                 had_content_delta = True
 
-            # Tool calls are terminal in normal Messages responses.  Preserve
-            # the legacy adapter's ordering for unusual tool-then-text streams,
-            # but defer that text with the transaction so a parser error cannot
-            # publish content past an uncommitted tool call.
-            for text_part in deferred_text_after_tool:
-                events.extend(
-                    _ensure_content_block_events(
-                        "text",
-                        TextBlock(text=""),
-                    )
-                )
-                events.append(
-                    ContentBlockDeltaEvent(
-                        index=content_block_index,
-                        delta=TextDelta(text=text_part),
-                    )
-                )
-                had_content_delta = True
-
             pending_tool_calls.clear()
-            deferred_text_after_tool.clear()
+            pending_segments.clear()
             return events
 
         def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
@@ -1715,18 +1763,9 @@ class AnthropicServing:
 
             # Handle tool call deltas
             if delta.tool_calls:
-                if deferred_text_after_tool:
-                    logger.warning(
-                        "Tool-call delta arrived after text following an "
-                        "uncommitted tool call; failing Anthropic stream closed"
-                    )
-                    await _close_openai_stream()
-                    for frame in _flush_on_error(
-                        "api_error", "Invalid tool-call stream ordering"
-                    ):
-                        yield frame
-                    return
                 tool_stream_error: Optional[str] = None
+                tool_stream_index: Optional[int] = None
+                tool_stream_has_name = False
                 for tc in delta.tool_calls:
                     tc_id = tc.id
                     tc_func = tc.function
@@ -1754,13 +1793,22 @@ class AnthropicServing:
                         pending = pending_tool_calls.get(tool_index)
                         if pending is None:
                             pending = _PendingAnthropicToolCall(
+                                tool_index=tool_index,
                                 id=tc_id or f"toolu_{uuid.uuid4().hex}",
                                 name=tc_func.name,
                                 argument_parts=[],
                             )
                             pending_tool_calls[tool_index] = pending
+                            pending_segments.append(pending)
                         elif pending.name != tc_func.name:
                             tool_stream_error = "Conflicting tool-call stream index"
+                            tool_stream_index = tool_index
+                            tool_stream_has_name = True
+                            break
+                        elif _pending_tool_has_following_text(pending):
+                            tool_stream_error = "Invalid tool-call stream ordering"
+                            tool_stream_index = tool_index
+                            tool_stream_has_name = True
                             break
                         elif tc_id:
                             pending.id = tc_id
@@ -1777,14 +1825,24 @@ class AnthropicServing:
                             if tool_index is not None
                             else None
                         )
-                        if pending is None:
+                        if pending is None or _pending_tool_has_following_text(pending):
                             tool_stream_error = "Invalid tool-call stream ordering"
+                            tool_stream_index = tool_index
+                            tool_stream_has_name = False
                             break
                         pending.argument_parts.append(argument_part)
 
                 if tool_stream_error is not None:
                     logger.warning(
-                        "%s; failing Anthropic stream closed", tool_stream_error
+                        "%s; failing Anthropic stream closed: rid=%s "
+                        "incoming_tool_index=%r incoming_has_name=%s "
+                        "active_tool_index=%r pending_segments=%s",
+                        tool_stream_error,
+                        chunk.id,
+                        tool_stream_index,
+                        tool_stream_has_name,
+                        active_tool_call_index,
+                        _pending_segment_kinds(),
                     )
                     await _close_openai_stream()
                     for frame in _flush_on_error("api_error", tool_stream_error):
@@ -1794,7 +1852,7 @@ class AnthropicServing:
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
                 if pending_tool_calls:
-                    deferred_text_after_tool.append(delta.content)
+                    _append_pending_text(delta.content)
                 else:
                     for event in _ensure_content_block_events(
                         "text",
@@ -1823,7 +1881,7 @@ class AnthropicServing:
                         yield frame
                     return
                 try:
-                    pending_events = _commit_pending_tool_events()
+                    pending_events = _commit_pending_content_events()
                 except MalformedToolCallError as e:
                     logger.warning("Rejecting buffered Anthropic tool call: %s", e)
                     await _close_openai_stream()
