@@ -4,8 +4,8 @@ import re
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     MalformedToolCallError,
@@ -24,6 +24,12 @@ _GENERIC_INVOKE_RE = re.compile(
 _DSML_TAG_PREFIX_RE = re.compile(r"</?｜DSML｜")
 _DSML_TAG_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _DSML_INVOKE_OPEN_RE = re.compile(r'<｜DSML｜invoke\s+name="[^"<>\r\n]+"\s*(?:>|/>)')
+_DSML_PROTOCOL_IN_VALUE_RE = re.compile(
+    r"</｜DSML｜[A-Za-z_][A-Za-z0-9_-]*\s*>"
+    r"|</?｜DSML｜(?:tool_calls|function_calls|invoke|parameter)\b"
+    r"|</parameter>\s*<\]"
+    r"|<[^<>\r\n]{0,8}DSML｜(?:tool_calls|function_calls|invoke|parameter)\b"
+)
 
 
 def find_malformed_generic_tool_call(
@@ -132,9 +138,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             r"(?:(?P<self_close>/>)"
             r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
         )
-        self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
-        self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
+        self.parameter_end_token = "</｜DSML｜parameter>"
         self.current_tool_id = -1
+        # The terminal validator needs the complete protocol envelope even
+        # after ordinary text and completed invokes have been consumed from the
+        # incremental buffer. This remains request-local and is released by
+        # ``finish``.
+        self._stream_text = ""
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -281,14 +291,76 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 continue
 
             logger.warning(
-                "DeepSeek output used malformed reserved DSML tag %r at "
-                "character %d",
+                "DeepSeek output used malformed reserved DSML tag %r at character %d",
                 tag_name,
                 marker.start(),
             )
             raise MalformedToolCallError(
                 "Model emitted malformed DeepSeek tool-call protocol"
             )
+
+    @staticmethod
+    def _raise_malformed_tool_protocol() -> None:
+        raise MalformedToolCallError(
+            "Model emitted malformed DeepSeek tool-call protocol"
+        )
+
+    @staticmethod
+    def _validate_tool_name(name: str, tools: list[Tool]) -> None:
+        """Reject canonical invokes for tools absent from this request.
+
+        ``BaseFormatDetector.parse_base_json`` historically drops unknown tools.
+        Once a model emitted a canonical DSML invoke, silently dropping it turns
+        an attempted tool call into a false ``end_turn`` success.  A streaming
+        client also cannot safely accept the name before this check.
+        """
+        declared = {tool.function.name for tool in tools if tool.function.name}
+        if name in declared or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+            return
+        logger.warning("DeepSeek output attempted undeclared tool %r", name)
+        DeepSeekV32Detector._raise_malformed_tool_protocol()
+
+    def _validate_complete_wrapper_structure(self, text: str) -> list[tuple[int, int]]:
+        """Require complete, non-nested wrappers outside invoke payloads.
+
+        Tool argument data is opaque. In particular, direct-JSON arguments may
+        legitimately contain literal DSML wrapper strings, so wrapper balance
+        is evaluated only in the protocol layer around complete invokes.
+        """
+        invoke_spans = [
+            (match.start(), match.end())
+            for match in re.finditer(self.invoke_regex, text, re.DOTALL)
+            if self._unpack_invoke_match(match)[2]
+        ]
+
+        def is_inside_invoke(offset: int) -> bool:
+            return any(start < offset < end for start, end in invoke_spans)
+
+        events: list[tuple[int, bool]] = []
+        for is_open, token in ((True, self.bot_token), (False, self.eot_token)):
+            start = 0
+            while (offset := text.find(token, start)) != -1:
+                if not is_inside_invoke(offset):
+                    events.append((offset, is_open))
+                start = offset + len(token)
+
+        depth = 0
+        content_start = -1
+        wrapper_spans: list[tuple[int, int]] = []
+        for offset, is_open in sorted(events):
+            if is_open:
+                if depth != 0:
+                    self._raise_malformed_tool_protocol()
+                depth = 1
+                content_start = offset + len(self.bot_token)
+            else:
+                if depth != 1:
+                    self._raise_malformed_tool_protocol()
+                depth = 0
+                wrapper_spans.append((content_start, offset))
+        if depth != 0:
+            self._raise_malformed_tool_protocol()
+        return wrapper_spans
 
     @classmethod
     def _ends_with_partial_tool_tag(cls, text: str) -> bool:
@@ -299,6 +371,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return False
         tail = stripped[last_lt:]
         return any(tag.startswith(tail) for tag in cls._DSML_TOOL_TAGS)
+
+    @staticmethod
+    def _ends_with_incomplete_reserved_dsml_tag(text: str) -> bool:
+        """Hold a split reserved tag until its name can be classified."""
+        stripped = text.rstrip()
+        last_lt = stripped.rfind("<")
+        if last_lt == -1:
+            return False
+        tail = stripped[last_lt:]
+        return tail.startswith(("<｜DSML｜", "</｜DSML｜")) and ">" not in tail
 
     @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
@@ -314,6 +396,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
 
+    @staticmethod
+    def _remove_partial_closing_token(value: str, token: str) -> str:
+        """Remove the longest trailing prefix of a structural closing token.
+
+        Streaming tokenization can split a closer at every character. The old
+        component-wise ``removesuffix`` loop only removed a few exact fragments
+        and let shapes such as ``</｜DSML｜invo`` enter public JSON arguments.
+        """
+        max_size = min(len(value), len(token) - 1)
+        for size in range(max_size, 0, -1):
+            if token.startswith(value[-size:]):
+                return value[:-size]
+        return value
+
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
@@ -328,17 +424,31 @@ class DeepSeekV32Detector(BaseFormatDetector):
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
             if allow_partial:
-                # Remove incomplete invoke end call prefix in case they are captured by param
-                # Use removesuffix (not rstrip) — rstrip treats the argument as a character
-                # set, which truncates values ending with chars in the token (e.g. "find /tmp"
-                # stripped to "find /" by rstrip("parameter")).
-                for token in reversed(self.prefix_invoke_end_call):
-                    invoke_content_stripped = invoke_content_stripped.removesuffix(
-                        token
+                # Once a complete object exists, freeze the argument at its JSON
+                # boundary. Any later bytes belong to the invoke delimiter (or
+                # malformed residue that the complete parse will reject).
+                try:
+                    value, end = json.JSONDecoder().raw_decode(invoke_content_stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return self._remove_partial_closing_token(
+                        invoke_content_stripped,
+                        self.invoke_end_token,
                     )
+                if isinstance(value, dict):
+                    return invoke_content_stripped[:end]
                 return invoke_content_stripped
-            elif invoke_content_stripped.endswith("}"):
-                return invoke_content_stripped
+
+            try:
+                direct_parameters = json.loads(invoke_content_stripped)
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                raise MalformedToolCallError(
+                    "Model emitted malformed DeepSeek tool-call parameters"
+                ) from e
+            if not isinstance(direct_parameters, dict):
+                raise MalformedToolCallError(
+                    "Model emitted non-object DeepSeek tool-call parameters"
+                )
+            return invoke_content_stripped
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
@@ -349,10 +459,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         last_match_end = 0
         for match in param_matches:
+            if (
+                not allow_partial
+                and invoke_content[last_match_end : match.start()].strip()
+            ):
+                self._raise_malformed_tool_protocol()
+
             param_name = match.group(1)
             param_type = match.group(2)
             param_value = match.group(3)
             last_match_end = match.end()
+
+            if param_name in parameters or param_type not in {"true", "false"}:
+                self._raise_malformed_tool_protocol()
+            if not allow_partial and _DSML_PROTOCOL_IN_VALUE_RE.search(param_value):
+                # Structural tags inside a parameter value are ambiguous with a
+                # damaged/nested parameter. Ordinary '<', shell redirection and
+                # non-structural DSML examples remain valid argument data.
+                self._raise_malformed_tool_protocol()
 
             # Convert value based on type
             if param_type == "true":  # string type
@@ -361,17 +485,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # Try to parse as JSON for other types
                 try:
                     parameters[param_name] = json.loads(param_value.strip())
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError) as e:
+                    if not allow_partial:
+                        raise MalformedToolCallError(
+                            "Model emitted malformed DeepSeek tool-call parameters"
+                        ) from e
                     parameters[param_name] = param_value.strip()
 
         # If allowed, try to parse a partial parameter at the end
         if allow_partial:
             remaining_content = invoke_content[last_match_end:]
 
-            # Remove incomplete parameter_end_call prefix in case they are captured by param
-            # Use removesuffix (not rstrip) — see rationale above.
-            for token in reversed(self.prefix_parameter_end_call):
-                remaining_content = remaining_content.removesuffix(token)
+            # Keep a split closing tag out of the partial parameter value.
+            remaining_content = self._remove_partial_closing_token(
+                remaining_content,
+                self.parameter_end_token,
+            )
 
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
@@ -391,6 +520,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     except (json.JSONDecodeError, MalformedJSON, ValueError):
                         parameters[param_name] = param_value.strip()
 
+        if not allow_partial and invoke_content[last_match_end:].strip():
+            self._raise_malformed_tool_protocol()
+
         return json.dumps(parameters, ensure_ascii=False)
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
@@ -403,38 +535,65 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._reject_malformed_generic_tool_call(text, tools)
         self._reject_malformed_reserved_dsml_tag(text)
-        idx = text.find(self.bot_token)
+        if self._ends_with_incomplete_reserved_dsml_tag(text):
+            self._raise_malformed_tool_protocol()
+        has_wrapper = self.bot_token in text
+        has_bare_invoke = "<｜DSML｜invoke" in text
+        idx = text.find(self.bot_token) if has_wrapper else text.find("<｜DSML｜invoke")
         normal_text = self._trim_tool_boundary_prefix(text[:idx]) if idx != -1 else text
-        if self.bot_token not in text:
+        if not has_wrapper and not has_bare_invoke:
             return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        wrapper_spans = self._validate_complete_wrapper_structure(text)
 
         calls = []
         try:
-            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
-            if not sections:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+            invoke_matches = list(re.finditer(self.invoke_regex, text, re.DOTALL))
+            if not invoke_matches:
+                self._raise_malformed_tool_protocol()
 
-            # Find all invoke blocks
-            for function_calls_content in sections:
-                for invoke_match in re.finditer(
-                    self.invoke_regex, function_calls_content, re.DOTALL
-                ):
-                    func_name, invoke_content, _ = self._unpack_invoke_match(
-                        invoke_match
-                    )
-                    func_args = self._parse_parameters_from_xml(invoke_content)
-                    # construct match_result for parse_base_json
-                    match_result = {
-                        "name": func_name,
-                        "parameters": json.loads(func_args),
-                    }
-                    calls.extend(self.parse_base_json(match_result, tools))
+            # Every wrapper is a protocol-only region. Validate its residue
+            # around invokes without using a non-greedy wrapper regex, which
+            # would mistake a literal ``</...tool_calls>`` inside direct JSON
+            # argument data for the real outer closer.
+            for section_start, section_end in wrapper_spans:
+                section_matches = [
+                    match
+                    for match in invoke_matches
+                    if section_start <= match.start() and match.end() <= section_end
+                ]
+                if not section_matches:
+                    self._raise_malformed_tool_protocol()
+                cursor = section_start
+                for invoke_match in section_matches:
+                    if text[cursor : invoke_match.start()].strip():
+                        self._raise_malformed_tool_protocol()
+                    cursor = invoke_match.end()
+                if text[cursor:section_end].strip():
+                    self._raise_malformed_tool_protocol()
+
+            for invoke_match in invoke_matches:
+                func_name, invoke_content, is_complete = self._unpack_invoke_match(
+                    invoke_match
+                )
+                if not is_complete:
+                    self._raise_malformed_tool_protocol()
+                self._validate_tool_name(func_name, tools)
+                func_args = self._parse_parameters_from_xml(invoke_content)
+                match_result = {
+                    "name": func_name,
+                    "parameters": json.loads(func_args),
+                }
+                calls.extend(self.parse_base_json(match_result, tools))
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except MalformedToolCallError:
+            raise
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+            logger.exception("Error in detect_and_parse")
+            raise MalformedToolCallError(
+                "Model emitted malformed DeepSeek tool-call protocol"
+            ) from e
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -443,6 +602,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         Streaming incremental parsing tool calls for DeepSeekV32 format.
         Supports multiple consecutive invoke blocks and argument streaming.
         """
+        self._stream_text += new_text
         self._buffer += new_text
         current_text = self._buffer
         self._reject_malformed_generic_tool_call(current_text, tools)
@@ -461,6 +621,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         ends_with_prefix = self._ends_with_partial_tool_tag(
             current_text
         ) or self._ends_with_partial_generic_invoke(current_text)
+        ends_with_prefix = (
+            ends_with_prefix
+            or self._ends_with_incomplete_reserved_dsml_tag(current_text)
+        )
 
         if (
             not self.has_tool_call(current_text)
@@ -521,6 +685,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
                     invoke_match
                 )
+                self._validate_tool_name(func_name, tools)
 
                 # Record the text before each invoke.  The first call's
                 # preamble and any text between later calls are both normal
@@ -631,6 +796,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 postamble
                 and not any(tag in postamble for tag in self._DSML_TOOL_TAGS)
                 and not self._ends_with_partial_tool_tag(postamble)
+                and not self._ends_with_incomplete_reserved_dsml_tag(postamble)
                 and not self._ends_with_partial_generic_invoke(postamble)
             ):
                 if (
@@ -653,6 +819,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 ordered_items=ordered_items,
             )
 
+        except MalformedToolCallError:
+            raise
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             # Do NOT clear self._buffer — retaining it lets the next chunk
@@ -671,15 +839,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         """Flush any text trapped in the buffer when the stream ends.
 
-        If the buffer contains DSML markers but no invoke was ever matched
-        (e.g. a DSML sub-tag appeared in response text), the text was never
-        flushed as normal_text.  This method returns it so the client
-        receives the content instead of silently losing it.
-
-        DSML tool-call tags (e.g. <｜DSML｜tool_calls>) are delimiters, not
-        content — they are stripped from the flushed text to prevent leaking
-        raw markup into the response.
+        Ordinary held text is released. Reserved tool-call syntax must form a
+        balanced wrapper with complete invokes; otherwise the model attempted a
+        tool call that cannot safely be represented as either a tool result or
+        normal text, so termination fails closed instead of fabricating an
+        ``end_turn`` success.
         """
+        stream_text = self._stream_text
+        self._stream_text = ""
+        self._validate_complete_wrapper_structure(stream_text)
+
         if not self._buffer:
             return StreamingParseResult()
         buffered = self._buffer
@@ -688,18 +857,28 @@ class DeepSeekV32Detector(BaseFormatDetector):
         last_lt = stripped.rfind("<")
         trailing_tag = stripped[last_lt:] if last_lt != -1 else ""
         if trailing_tag.startswith(("<｜DSML", "</｜DSML")) and ">" not in trailing_tag:
-            logger.warning(
-                "Dropping incomplete reserved DSML tool-call tag at stream end"
-            )
-            buffered = buffered[:last_lt]
+            logger.warning("DeepSeek tool-call protocol ended mid-tag or wrapper")
+            self._raise_malformed_tool_protocol()
         # If we successfully parsed tool calls, the buffer holds only
         # trailing whitespace or closing tags — don't emit those.
         if self.current_tool_id != -1 and self.prev_tool_call_arr:
+            remainder = buffered.replace(self.eot_token, "").strip()
+            if remainder:
+                logger.warning(
+                    "DeepSeek tool-call protocol left trailing unparsed content"
+                )
+                self._raise_malformed_tool_protocol()
             return StreamingParseResult()
         # No tool calls were parsed — the buffer is trapped text.
         # Strip everything from the earliest DSML tool-call tag onward:
         # tags are delimiters, not content.  Use _DSML_TOOL_TAGS (without
         # ">") so partial tags like "<｜DSML｜tool_calls" are also stripped.
+        if self.has_tool_call(buffered) or any(
+            tag in buffered for tag in self._DSML_TOOL_TAGS
+        ):
+            logger.warning("DeepSeek tool-call intent ended without a parsed invoke")
+            self._raise_malformed_tool_protocol()
+
         earliest = len(buffered)
         for tag in self._DSML_TOOL_TAGS:
             idx = buffered.find(tag)

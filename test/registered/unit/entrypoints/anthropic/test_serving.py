@@ -9,7 +9,6 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
-
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
@@ -197,6 +196,53 @@ class TestAnthropicServing(unittest.TestCase):
         }
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
+
+    def _declared_tool_request(self, *tools, **overrides):
+        """Build a streaming request with explicit client-tool schemas."""
+        declarations = []
+        for tool in tools:
+            if isinstance(tool, str):
+                declarations.append(
+                    {
+                        "name": tool,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                    }
+                )
+            else:
+                declarations.append(tool)
+        return self._anthropic_request(tools=declarations, **overrides)
+
+    def _single_tool_stream_events(self, request, name, arguments):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_capture",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        return asyncio.run(_collect_anthropic_events(serving, request))
 
     def _tool_result_request(self, content, tools=None):
         overrides = {
@@ -953,6 +999,235 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertNotIn("corrupt", json.dumps(events))
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_v10_stream_rejects_v9_schema_failures_before_tool_start(self):
+        schemas_and_arguments = {
+            "bash_missing_command": (
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                {"description": "show files"},
+            ),
+            "read_missing_file_path": (
+                {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "offset": {"type": "integer"},
+                        },
+                        "required": ["file_path"],
+                    },
+                },
+                {"offset": 10},
+            ),
+            "edit_missing_new_string": (
+                {
+                    "name": "Edit",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+                {"file_path": "/tmp/a", "old_string": "old"},
+            ),
+            "wrong_required_type": (
+                {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+                {"file_path": 42},
+            ),
+            "unknown_property": (
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                {"command": "pwd", "protocol_fragment": "damaged"},
+            ),
+        }
+
+        for failure_class, (tool, arguments) in schemas_and_arguments.items():
+            with self.subTest(failure_class=failure_class):
+                request = self._declared_tool_request(tool)
+                events = self._single_tool_stream_events(
+                    request,
+                    tool["name"],
+                    json.dumps(arguments),
+                )
+                self.assertEqual(
+                    [event["type"] for event in events],
+                    ["message_start", "error", "message_stop"],
+                )
+                self.assertIn(
+                    "declared schema",
+                    events[1]["error"]["message"],
+                )
+
+    def test_v10_stream_rejects_undeclared_v9_tool_before_tool_start(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        events = self._single_tool_stream_events(
+            request,
+            "mcp__azure-devops__repo_get_pull_request",
+            "{}",
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertIn("undeclared tool", events[1]["error"]["message"])
+
+    def test_v10_stream_treats_schema_valid_tool_strings_as_opaque(self):
+        """The Anthropic boundary must not blacklist XML/DSML argument data.
+
+        Raw DSML grammar corruption is rejected by the DeepSeek detector. Once
+        an upstream parser has produced a schema-valid JSON object, arbitrary
+        strings remain valid Messages API tool input.
+        """
+        tool = {
+            "name": "Bash",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+        request = self._declared_tool_request(tool)
+        command = "printf '%s' '</parameter></｜DSML｜lockImports>'"
+        events = self._single_tool_stream_events(
+            request,
+            "Bash",
+            json.dumps({"command": command}, ensure_ascii=False),
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        arguments = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"].get("type") == "input_json_delta"
+        )
+        self.assertEqual(json.loads(arguments), {"command": command})
+
+    def test_v10_stream_publishes_declared_schema_valid_call(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+        events = self._single_tool_stream_events(
+            request,
+            "Bash",
+            '{"command":"printf hello","timeout":30}',
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event for event in events if event["type"] == "content_block_start"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "Bash")
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v10_parallel_calls_are_atomic_when_one_schema_is_invalid(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_valid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": '{"file_path":"/tmp/a"}',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_invalid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
 
     def test_stream_tool_text_then_fresh_tool_preserves_order_atomically(self):
         serving = self._serving(
@@ -2086,6 +2361,102 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(len(anthropic_response.content), 1)
         self.assertEqual(anthropic_response.content[0].type, "text")
         self.assertEqual(anthropic_response.content[0].text, "")
+
+    def test_v10_non_streaming_invalid_tool_json_is_not_rewritten_to_empty_input(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-v10-invalid-json",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Read",
+                                        "arguments": '{"file_path":',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "total_tokens": 10,
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(
+            MalformedToolCallError, "malformed tool-call arguments"
+        ):
+            self._serving()._convert_response(response)
+
+    def test_v10_non_streaming_schema_failure_returns_anthropic_api_error(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-v10-schema",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Read",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "total_tokens": 10,
+                },
+            }
+        )
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(response))
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "read"}],
+        )
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
+        self.assertEqual(result.status_code, 500)
+        self.assertEqual(payload["error"]["type"], "api_error")
+        self.assertIn("declared schema", payload["error"]["message"])
 
     def test_error_response_does_not_leak_exception_name(self):
         """``error.type`` must stay in Anthropic's documented literal set."""

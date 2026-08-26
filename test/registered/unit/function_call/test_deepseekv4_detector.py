@@ -1,8 +1,10 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import MalformedToolCallError
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,7 +37,7 @@ def _generic_weather_call(*, mixed: bool = False) -> str:
     if mixed:
         return (
             '<invoke name="get_weather">\n'
-            f'{_param("city", "true", "SF")}\n'
+            f"{_param('city', 'true', 'SF')}\n"
             f"</{DSML}invoke>\n</{DSML}tool_calls>"
         )
     return (
@@ -61,6 +63,55 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                 ),
             )
         ]
+        self.production_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="Bash",
+                    description="Run a command",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="Read",
+                    description="Read a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": ["file_path"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="Edit",
+                    description="Edit a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                ),
+            ),
+        ]
 
     def _feed(self, chunks):
         """Returns (normal_text, calls) accumulated over the chunks."""
@@ -71,6 +122,30 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             normal += result.normal_text
             calls.extend(result.calls)
         return normal, calls
+
+    def _assert_malformed_for_all_chunk_boundaries(self, text, tools=None):
+        """Exercise one-shot, token-like, and every two-delta split path."""
+        tools = tools or self.production_tools
+        with self.assertRaises(MalformedToolCallError):
+            DeepSeekV4Detector().detect_and_parse(text, tools)
+
+        chunkings = [[text], list(text)]
+        chunkings.extend(
+            [[text[:split], text[split:]] for split in range(len(text) + 1)]
+        )
+        for chunks in chunkings:
+            detector = DeepSeekV4Detector()
+            rejected = False
+            try:
+                for chunk in chunks:
+                    detector.parse_streaming_increment(chunk, tools)
+                detector.finish(tools)
+            except MalformedToolCallError:
+                rejected = True
+            self.assertTrue(
+                rejected,
+                f"malformed tool protocol survived chunking {chunks!r}",
+            )
 
     def test_preamble_in_same_delta_as_tool_call(self):
         """Prose sharing a delta with the tool call must not be dropped, and the
@@ -316,8 +391,8 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             f"Text before <{DSML}tool_crossing",
             f"</{DSML}block>",
             f"</{DSML}function_calls> → Fix the malformed closing tag",
-            f"Text before <{DSML}tool_calls\n<{DSML}invoke " 'name="get_weather">',
-            f'<{DSML}invoke name="get_weather <{DSML}parameter ' "name subject para?>",
+            f'Text before <{DSML}tool_calls\n<{DSML}invoke name="get_weather">',
+            f'<{DSML}invoke name="get_weather <{DSML}parameter name subject para?>',
             f'<{DSML}invoke name="get_weather" false=""/>',
         ]
         for text in samples:
@@ -352,14 +427,12 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                 f'<{DSML}invoke name="get_weather">', self.tools
             )
 
-    def test_incomplete_reserved_dsml_is_not_leaked_at_stream_end(self):
+    def test_incomplete_reserved_dsml_fails_closed_at_stream_end(self):
         detector = DeepSeekV4Detector()
         detector.parse_streaming_increment(f"Safe preamble. <{DSML}tool_", self.tools)
 
-        result = detector.finish(self.tools)
-
-        self.assertEqual(result.normal_text, "Safe preamble. ")
-        self.assertNotIn(DSML, result.normal_text)
+        with self.assertRaises(MalformedToolCallError):
+            detector.finish(self.tools)
 
     def test_dsml_parameter_example_remains_normal_text(self):
         text = f'The literal `<{DSML}parameter name="x">` is a parameter tag.'
@@ -377,6 +450,236 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertIn("custom_marker", result.calls[0].parameters)
+
+    def test_v9_capture_malformed_invoke_bodies_fail_for_every_chunk_boundary(self):
+        """All successful-but-corrupt V9 native output families fail closed.
+
+        These are minimized forms of the captured Bash/Read/Edit generations.
+        They deliberately preserve the damaged syntax rather than only testing
+        generic invalid XML, because several shapes previously produced valid
+        JSON with missing or contaminated fields.
+        """
+        p = _param
+        samples = {
+            "generic_parameter_opener": _wrapped(
+                _invoke(
+                    "Bash",
+                    '<parameter name="command" string="true">pwd'
+                    f"</{DSML}parameter>\n"
+                    + p("description", "true", "show directory"),
+                )
+            ),
+            "non_boolean_string_attribute": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd")
+                    + f'\n<{DSML}parameter name="description" string="税种">x'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "generic_closer_in_value": _wrapped(
+                _invoke("Bash", p("command", "true", "pwd</parameter>\n<]"))
+            ),
+            "replacement_character_dsml_prefix": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd")
+                    + f'\n<���DSML｜parameter name="description" string="true">x'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "extra_parameter_closer": _wrapped(
+                _invoke(
+                    "Read",
+                    p("file_path", "true", "/tmp/a") + f"\n</{DSML}parameter>",
+                )
+            ),
+            "foreign_dsml_closer_in_value": _wrapped(
+                _invoke(
+                    "Read",
+                    p("file_path", "true", f"/tmp/a</{DSML}lockImports>"),
+                )
+            ),
+            "missing_name_equals": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd")
+                    + f'\n<{DSML}parameter name "description" string="true">x'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "duplicate_name_attribute": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd")
+                    + f'\n<{DSML}parameter name name="description" string="true">x'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "multilingual_dsml_closer": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd") + f"\n</{DSML}调用>",
+                )
+            ),
+            "generic_pseudocall_without_invoke": (
+                f"<{DSML}tool_calls>\n"
+                f'<;Bash><parameter name="command">pwd</parameter></Bash>\n'
+                f"</{DSML}invoke>\n</{DSML}tool_calls>"
+            ),
+            "malformed_optional_limit": _wrapped(
+                _invoke(
+                    "Read",
+                    p("file_path", "true", "/tmp/a")
+                    + f'\n<{DSML}parameter name "limit" string="false">10'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "missing_parameter_close_angle": _wrapped(
+                _invoke(
+                    "Read",
+                    f'<{DSML}parameter name="file_path" string="true">/tmp/a'
+                    f"</{DSML}parameter "
+                    f'<{DSML}parameter name="offset" string="false">1'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "corrupt_dsml_separator": _wrapped(
+                _invoke(
+                    "Bash",
+                    p("command", "true", "pwd")
+                    + '<｜DSML�parameter name="description" string="true">x'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "invalid_self_closing_parameter": _wrapped(
+                _invoke(
+                    "Read",
+                    f'<{DSML}parameter name="file_path" string=" string" />',
+                )
+            ),
+            "malformed_new_string": _wrapped(
+                _invoke(
+                    "Edit",
+                    p("file_path", "true", "/tmp/a")
+                    + p("old_string", "true", "old")
+                    + f'\n<{DSML}parameter name new_string="" new_string="">new'
+                    f"</{DSML}parameter>",
+                )
+            ),
+            "undeclared_canonical_tool": _wrapped(
+                _invoke("mcp__azure-devops__repo_get_pull_request", "")
+            ),
+        }
+
+        for failure_class, text in samples.items():
+            with self.subTest(failure_class=failure_class):
+                self._assert_malformed_for_all_chunk_boundaries(text)
+
+    def test_v9_hard_error_tag_families_fail_for_every_chunk_boundary(self):
+        """Representative complete forms for all seven V9 detector log classes."""
+        samples = {
+            "tool_calls_char_0": f'<{DSML}tool_calls false="">',
+            "tool_calls_char_2": f"  <{DSML}tool_calls unexpected",
+            "tool_c_char_0": f"<{DSML}tool_c",
+            "public_char_1": f" <{DSML}public>",
+            "end_char_1": f" </{DSML}end>",
+            "invoke_char_21": (
+                f'preamble-at-offset-21<{DSML}invoke name="Bash" false="">'
+            ),
+            "tool_calls_unclosed": f"<{DSML}tool_calls>",
+        }
+        for failure_class, text in samples.items():
+            with self.subTest(failure_class=failure_class):
+                self._assert_malformed_for_all_chunk_boundaries(text)
+
+    def test_complete_parameter_grammar_accepts_json_scalars_and_shell_syntax(self):
+        params = "\n".join(
+            [
+                _param(
+                    "city",
+                    "true",
+                    "grep '</parameter>' file.xml && printf '<xml> x > y'",
+                ),
+                _param("days", "false", "[1, 2, 3]"),
+            ]
+        )
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "array"},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        result = DeepSeekV4Detector().detect_and_parse(
+            _wrapped(_invoke("get_weather", params)), tools
+        )
+        arguments = json.loads(result.calls[0].parameters)
+        self.assertEqual(
+            arguments["city"],
+            "grep '</parameter>' file.xml && printf '<xml> x > y'",
+        )
+        self.assertEqual(arguments["days"], [1, 2, 3])
+
+    def test_direct_json_parameters_must_be_one_complete_object(self):
+        for body in ('{"city":"SF"} trailing', '[{"city":"SF"}]', '{"city":'):
+            with self.subTest(body=body):
+                self._assert_malformed_for_all_chunk_boundaries(
+                    _wrapped(_invoke("get_weather", body)), self.tools
+                )
+
+    def test_direct_json_argument_may_contain_literal_wrapper_text(self):
+        literal = f"example </{DSML}tool_calls> remains argument data"
+        text = _wrapped(
+            _invoke("get_weather", json.dumps({"city": literal}, ensure_ascii=False))
+        )
+
+        one_shot = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        detector = DeepSeekV4Detector()
+        results = [
+            detector.parse_streaming_increment(character, self.tools)
+            for character in text
+        ]
+        results.append(detector.finish(self.tools))
+        normal = "".join(result.normal_text for result in results)
+        streamed = [call for result in results for call in result.calls]
+
+        self.assertEqual(normal, "")
+        self.assertEqual(json.loads(one_shot.calls[0].parameters), {"city": literal})
+        streamed_args = "".join(call.parameters for call in streamed)
+        self.assertEqual(json.loads(streamed_args), {"city": literal})
+
+    def test_xml_closing_tag_prefixes_never_enter_streamed_arguments(self):
+        text = _weather_call("find /tmp and /opt")
+        detector = DeepSeekV4Detector()
+        results = [
+            detector.parse_streaming_increment(character, self.tools)
+            for character in text
+        ]
+        results.append(detector.finish(self.tools))
+
+        streamed_args = "".join(
+            call.parameters for result in results for call in result.calls
+        )
+        self.assertEqual(json.loads(streamed_args), {"city": "find /tmp and /opt"})
+        self.assertNotIn(DSML, streamed_args)
+
+    def test_explicit_unknown_tool_forwarding_setting_is_preserved(self):
+        text = _wrapped(_invoke("future_tool", ""))
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "future_tool")
 
 
 if __name__ == "__main__":

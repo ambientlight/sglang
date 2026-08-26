@@ -22,8 +22,10 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError as JSONSchemaError
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, ValidationError
-
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -132,6 +134,48 @@ _PendingAnthropicSegment = Union[
     _PendingAnthropicToolCall,
     _PendingAnthropicTextSegment,
 ]
+
+
+def _validate_anthropic_tool_input(
+    request: AnthropicMessagesRequest,
+    name: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Validate a model-produced call before publishing ``tool_use``.
+
+    The Messages API contract says a client ``tool_use.input`` matches the
+    declared ``input_schema``.  V9 only checked for a JSON object, allowing
+    missing required fields and undeclared names to escape as nominally
+    successful calls. Raw parser grammar is validated in the model-specific
+    detector; this API-layer check deliberately treats schema-valid strings as
+    opaque so legitimate XML or DSML-like tool input remains supported.
+
+    Unit-level translation tests sometimes omit request tools entirely and feed
+    synthetic OpenAI chunks directly. Preserve that internal compatibility;
+    real requests with a ``tools`` field are validated strictly.
+    """
+    if request.tools is None:
+        return
+
+    schemas: dict[str, dict[str, Any]] = {}
+    for tool in request.tools:
+        if not is_server_tool(tool):
+            schemas[tool.name] = tool.input_schema
+
+    schema = schemas.get(name)
+    if schema is None:
+        raise MalformedToolCallError("Model attempted to call an undeclared tool")
+
+    try:
+        Draft202012Validator(schema).validate(tool_input)
+    except JSONSchemaValidationError as e:
+        raise MalformedToolCallError(
+            "Model emitted tool-call arguments that do not match the declared schema"
+        ) from e
+    except (JSONSchemaError, RecursionError) as e:
+        # Request validation normally catches this before generation. Keep the
+        # publication boundary safe when called directly or by a custom route.
+        raise MalformedToolCallError("Declared tool schema is invalid") from e
 
 
 class _ThinkingSignatureCodec:
@@ -1162,8 +1206,18 @@ class AnthropicServing:
             # It's an error response (ORJSONResponse)
             return self._convert_openai_error_response(response)
 
-        # Convert to Anthropic response
-        anthropic_response = self._convert_response(response, anthropic_request)
+        # Convert to Anthropic response. Model-produced tool calls are validated
+        # at the same atomic boundary as streaming responses; malformed input
+        # must not be rewritten to an indistinguishable empty tool call.
+        try:
+            anthropic_response = self._convert_response(response, anthropic_request)
+        except MalformedToolCallError as e:
+            logger.warning("Rejecting non-streaming Anthropic tool call: %s", e)
+            return self._error_response(
+                status_code=500,
+                error_type="api_error",
+                message=str(e),
+            )
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -1461,6 +1515,7 @@ class AnthropicServing:
 
             for pending in pending_tool_calls.values():
                 arguments = "".join(pending.argument_parts)
+                parsed_arguments: dict[str, Any] = {}
                 if arguments:
                     try:
                         parsed_arguments = json.loads(arguments)
@@ -1472,6 +1527,11 @@ class AnthropicServing:
                         raise MalformedToolCallError(
                             "Model emitted non-object tool-call arguments"
                         )
+                _validate_anthropic_tool_input(
+                    anthropic_request,
+                    pending.name,
+                    parsed_arguments,
+                )
 
             events: list[AnthropicStreamEvent] = []
             for segment in pending_segments:
@@ -1953,18 +2013,21 @@ class AnthropicServing:
             for tool_call in choice.message.tool_calls:
                 raw_args = tool_call.function.arguments
                 try:
-                    tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
+                    tool_input = json.loads(raw_args) if raw_args else {}
+                except (json.JSONDecodeError, TypeError) as e:
+                    raise MalformedToolCallError(
+                        "Model emitted malformed tool-call arguments"
+                    ) from e
+                if not isinstance(tool_input, dict):
+                    raise MalformedToolCallError(
+                        "Model emitted non-object tool-call arguments"
                     )
-                    tool_input = {}
+                if anthropic_request is not None:
+                    _validate_anthropic_tool_input(
+                        anthropic_request,
+                        tool_call.function.name,
+                        tool_input,
+                    )
 
                 content.append(
                     ToolUseBlock(
