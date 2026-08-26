@@ -16,7 +16,16 @@ import pathlib
 import uuid
 import zlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
+from enum import Enum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Optional,
+    Union,
+)
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -46,6 +55,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     MessageDeltaEvent,
     MessageStartEvent,
     MessageStopEvent,
+    PingEvent,
     SignatureDelta,
     TextBlock,
     TextDelta,
@@ -104,6 +114,72 @@ _THINKING_KEY_FILE_ENV = "SGLANG_ANTHROPIC_THINKING_KEY_FILE"
 _THINKING_SIGNATURE_PREFIX = "sglang_thinking_v1."
 _THINKING_SIGNATURE_AAD = b"sglang-anthropic-thinking-v1"
 _MAX_SEALED_THINKING_BYTES = 8 * 1024 * 1024
+_TOOL_RECOVERY_ENV = "SGLANG_ANTHROPIC_TOOL_RECOVERY"
+_TOOL_RECOVERY_TIMEOUT_ENV = "SGLANG_ANTHROPIC_TOOL_RECOVERY_TIMEOUT_S"
+_TOOL_RECOVERY_MAX_TOKENS_ENV = "SGLANG_ANTHROPIC_TOOL_RECOVERY_MAX_TOKENS"
+_TOOL_RECOVERY_CONCURRENCY_ENV = "SGLANG_ANTHROPIC_TOOL_RECOVERY_CONCURRENCY"
+_TOOL_RECOVERY_PING_INTERVAL_ENV = "SGLANG_ANTHROPIC_TOOL_RECOVERY_PING_INTERVAL_S"
+
+
+class _ToolRecoveryReason(str, Enum):
+    MALFORMED_PROTOCOL = "malformed_protocol"
+    MALFORMED_ARGUMENTS = "malformed_arguments"
+    NON_OBJECT_ARGUMENTS = "non_object_arguments"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    UNDECLARED_TOOL = "undeclared_tool"
+    STREAM_ORDERING = "stream_ordering"
+    INCOMPLETE_STREAM = "incomplete_stream"
+
+
+def _classify_tool_recovery_reason(message: str) -> Optional[_ToolRecoveryReason]:
+    """Map outward failure text to a stable, non-payload diagnostic code."""
+
+    normalized = (message or "").lower()
+    if "arguments that do not match the declared schema" in normalized:
+        return _ToolRecoveryReason.SCHEMA_MISMATCH
+    if "undeclared tool" in normalized:
+        return _ToolRecoveryReason.UNDECLARED_TOOL
+    if "non-object" in normalized and (
+        "tool-call" in normalized or "deepseek tool-call" in normalized
+    ):
+        return _ToolRecoveryReason.NON_OBJECT_ARGUMENTS
+    if "malformed tool-call arguments" in normalized:
+        return _ToolRecoveryReason.MALFORMED_ARGUMENTS
+    if (
+        "invalid tool-call stream ordering" in normalized
+        or "conflicting tool-call stream index" in normalized
+    ):
+        return _ToolRecoveryReason.STREAM_ORDERING
+    if "incomplete tool-call stream" in normalized:
+        return _ToolRecoveryReason.INCOMPLETE_STREAM
+    if "malformed" in normalized and "tool" in normalized:
+        return _ToolRecoveryReason.MALFORMED_PROTOCOL
+    return None
+
+
+def _bounded_positive_int_env(
+    name: str,
+    default: int,
+    maximum: int,
+) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    if value < 1 or value > maximum:
+        logger.warning(
+            "Ignoring out-of-range %s=%r (expected 1..%d); using %d",
+            name,
+            raw,
+            maximum,
+            default,
+        )
+        return default
+    return value
 
 
 @dataclass
@@ -136,42 +212,67 @@ _PendingAnthropicSegment = Union[
 ]
 
 
+@dataclass(frozen=True)
+class _RecoveredAnthropicToolCall:
+    id: str
+    name: str
+    tool_input: dict[str, Any]
+    argument_json: str
+
+
+@dataclass(frozen=True)
+class _AnthropicToolRecoveryResult:
+    calls: tuple[_RecoveredAnthropicToolCall, ...]
+    usage: Any
+    model: str
+    recovery_rid: str
+    response: ChatCompletionResponse
+
+
 def _validate_anthropic_tool_input(
     request: AnthropicMessagesRequest,
     name: str,
     tool_input: dict[str, Any],
+    *,
+    enforce_schema: bool = False,
 ) -> None:
     """Validate a model-produced call before publishing ``tool_use``.
 
-    The Messages API contract says a client ``tool_use.input`` matches the
-    declared ``input_schema``.  V9 only checked for a JSON object, allowing
-    missing required fields and undeclared names to escape as nominally
-    successful calls. Raw parser grammar is validated in the model-specific
-    detector; this API-layer check deliberately treats schema-valid strings as
-    opaque so legitimate XML or DSML-like tool input remains supported.
+    Anthropic guarantees schema conformance only for tools declared with
+    ``strict: true``.  A syntactically valid object from a non-strict tool must
+    reach the client so its normal ``tool_result`` validation/error loop can
+    ask the model to correct the call. Raw parser grammar is validated in the
+    model-specific detector; this API-layer check deliberately treats
+    schema-valid strings as opaque so legitimate XML or DSML-like tool input
+    remains supported.
 
     Unit-level translation tests sometimes omit request tools entirely and feed
-    synthetic OpenAI chunks directly. Preserve that internal compatibility;
-    real requests with a ``tools`` field are validated strictly.
+    synthetic OpenAI chunks directly. Preserve that internal compatibility.
     """
     if request.tools is None:
         return
 
-    schemas: dict[str, dict[str, Any]] = {}
+    declarations = {}
     for tool in request.tools:
         if not is_server_tool(tool):
-            schemas[tool.name] = tool.input_schema
+            declarations[tool.name] = tool
 
-    schema = schemas.get(name)
-    if schema is None:
+    declaration = declarations.get(name)
+    if declaration is None:
         raise MalformedToolCallError("Model attempted to call an undeclared tool")
 
     try:
-        Draft202012Validator(schema).validate(tool_input)
+        Draft202012Validator(declaration.input_schema).validate(tool_input)
     except JSONSchemaValidationError as e:
-        raise MalformedToolCallError(
-            "Model emitted tool-call arguments that do not match the declared schema"
-        ) from e
+        if enforce_schema or declaration.strict is True:
+            raise MalformedToolCallError(
+                "Model emitted tool-call arguments that do not match the declared schema"
+            ) from e
+        logger.warning(
+            "Publishing schema-invalid arguments for non-strict Anthropic tool %r; "
+            "the client may return an is_error tool_result",
+            name,
+        )
     except (JSONSchemaError, RecursionError) as e:
         # Request validation normally catches this before generation. Keep the
         # publication boundary safe when called directly or by a custom route.
@@ -527,6 +628,28 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     return cleaned or "Request failed"
 
 
+def _openai_error_message(response: Any) -> Optional[str]:
+    """Extract an OpenAI error message without exposing it to success paths."""
+
+    direct_message = getattr(response, "message", None)
+    if isinstance(direct_message, str):
+        return direct_message
+    body = getattr(response, "body", b"") or b""
+    if not body:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error_payload = payload.get("error", payload)
+    if isinstance(error_payload, dict):
+        message = error_payload.get("message")
+        return message if isinstance(message, str) else None
+    return error_payload if isinstance(error_payload, str) else None
+
+
 class AnthropicServing:
     """Handler for Anthropic Messages API requests.
 
@@ -536,6 +659,43 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
+        recovery_flag = os.getenv(_TOOL_RECOVERY_ENV, "0").strip().lower()
+        self._tool_recovery_enabled = recovery_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self._tool_recovery_timeout_s = _bounded_positive_int_env(
+            _TOOL_RECOVERY_TIMEOUT_ENV,
+            default=180,
+            maximum=3600,
+        )
+        self._tool_recovery_max_tokens = _bounded_positive_int_env(
+            _TOOL_RECOVERY_MAX_TOKENS_ENV,
+            default=8192,
+            maximum=131072,
+        )
+        recovery_concurrency = _bounded_positive_int_env(
+            _TOOL_RECOVERY_CONCURRENCY_ENV,
+            default=2,
+            maximum=64,
+        )
+        self._tool_recovery_ping_interval_s = _bounded_positive_int_env(
+            _TOOL_RECOVERY_PING_INTERVAL_ENV,
+            default=10,
+            maximum=60,
+        )
+        self._tool_recovery_slots = asyncio.Semaphore(recovery_concurrency)
+        logger.info(
+            "Anthropic bounded tool-call recovery: %s timeout_s=%d "
+            "max_tokens=%d concurrency=%d ping_interval_s=%d",
+            "enabled" if self._tool_recovery_enabled else "disabled",
+            self._tool_recovery_timeout_s,
+            self._tool_recovery_max_tokens,
+            recovery_concurrency,
+            self._tool_recovery_ping_interval_s,
+        )
         self._thinking_signature_codec = _ThinkingSignatureCodec.from_environment()
         if self._thinking_signature_codec is not None:
             logger.info(
@@ -568,6 +728,331 @@ class AnthropicServing:
         if tokenizer is None:
             return None
         return getattr(tokenizer, "chat_template", None)
+
+    @staticmethod
+    def _validated_recovery_calls(
+        response: ChatCompletionResponse,
+        anthropic_request: AnthropicMessagesRequest,
+        recovery_rid: str,
+        allowed_tool_names: Optional[set[str]] = None,
+    ) -> _AnthropicToolRecoveryResult:
+        """Extract an all-or-nothing, wire-valid tool suffix from a retry.
+
+        Original ``strict`` semantics remain authoritative: a non-strict
+        schema mismatch may reach the client, while strict mismatches fail.
+        """
+
+        if not response.choices or not response.choices[0].message.tool_calls:
+            raise MalformedToolCallError(
+                "Constrained tool-call recovery produced no tool call"
+            )
+        if response.choices[0].finish_reason not in {"tool_calls", "stop"}:
+            raise MalformedToolCallError(
+                "Constrained tool-call recovery ended before completing tool calls"
+            )
+
+        recovered: list[_RecoveredAnthropicToolCall] = []
+        for tool_call in response.choices[0].message.tool_calls:
+            if (
+                allowed_tool_names is not None
+                and tool_call.function.name not in allowed_tool_names
+            ):
+                raise MalformedToolCallError(
+                    "Constrained tool-call recovery emitted a tool outside its "
+                    "allowed intent set"
+                )
+            raw_arguments = tool_call.function.arguments
+            try:
+                if isinstance(raw_arguments, dict):
+                    tool_input = raw_arguments
+                else:
+                    tool_input = json.loads(raw_arguments) if raw_arguments else {}
+            except (json.JSONDecodeError, TypeError) as e:
+                raise MalformedToolCallError(
+                    "Constrained tool-call recovery emitted malformed arguments"
+                ) from e
+            if not isinstance(tool_input, dict):
+                raise MalformedToolCallError(
+                    "Constrained tool-call recovery emitted non-object arguments"
+                )
+
+            _validate_anthropic_tool_input(
+                anthropic_request,
+                tool_call.function.name,
+                tool_input,
+            )
+            recovered.append(
+                _RecoveredAnthropicToolCall(
+                    id=tool_call.id or f"toolu_{uuid.uuid4().hex}",
+                    name=tool_call.function.name,
+                    tool_input=tool_input,
+                    argument_json=json.dumps(
+                        tool_input,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+
+        return _AnthropicToolRecoveryResult(
+            calls=tuple(recovered),
+            usage=response.usage,
+            model=response.model,
+            recovery_rid=recovery_rid,
+            response=response,
+        )
+
+    def _response_from_recovery(
+        self,
+        result: _AnthropicToolRecoveryResult,
+        anthropic_request: AnthropicMessagesRequest,
+    ) -> AnthropicMessagesResponse:
+        # No part of the failed non-streaming attempt reached the client, so
+        # preserve the validated retry's thinking/signature/text exactly as a
+        # normal successful response. Streaming recovery intentionally emits
+        # only ``result.calls`` because its original prefix is already on wire.
+        return self._convert_response(result.response, anthropic_request)
+
+    async def _attempt_tool_call_recovery(
+        self,
+        processed_request: ChatCompletionRequest,
+        anthropic_request: AnthropicMessagesRequest,
+        raw_request: Request,
+        reason: _ToolRecoveryReason,
+        original_rid: Optional[str],
+        candidate_tool_names: tuple[str, ...] = (),
+    ) -> Optional[_AnthropicToolRecoveryResult]:
+        """Run one isolated, grammar-constrained tool-only regeneration.
+
+        The caller owns the one-attempt bound. This method always assigns a
+        fresh RID, disables SGLang session mutation, forces native tool grammar
+        plus parameter schemas, and accepts only a wire-valid tool suffix.
+        The streaming caller intentionally discards retry reasoning/text; the
+        non-streaming caller can preserve the complete validated retry.
+        """
+
+        if not self._tool_recovery_enabled or not processed_request.tools:
+            return None
+        if processed_request.tool_choice == "none":
+            return None
+        if any(
+            getattr(processed_request, field, None) is not None
+            for field in (
+                "bootstrap_host",
+                "bootstrap_port",
+                "bootstrap_room",
+                "disagg_prefill_dp_rank",
+            )
+        ):
+            logger.warning(
+                "Anthropic tool recovery skipped for PD-disaggregated request; "
+                "a fresh coordinated bootstrap room is required"
+            )
+            return None
+
+        # Scheduler aborts intentionally match RID prefixes so one parent can
+        # cancel a generated batch. The original RID may be header-controlled,
+        # so a fixed recovery prefix is unsafe (for example, an original RID
+        # of ``toolrecovery_`` would also abort ``toolrecovery_<uuid>``). Put
+        # entropy first and reject the rare prefix collision explicitly.
+        while True:
+            recovery_rid = f"{uuid.uuid4().hex}_toolrecovery"
+            if not original_rid or not recovery_rid.startswith(original_rid):
+                break
+        declared_names = {
+            tool.function.name for tool in (processed_request.tools or [])
+        }
+        original_named_tool = (
+            processed_request.tool_choice.function.name
+            if isinstance(processed_request.tool_choice, ToolChoice)
+            else None
+        )
+        observed_declared_names = declared_names.intersection(candidate_tool_names)
+        allowed_tool_names = (
+            {original_named_tool}
+            if original_named_tool is not None
+            else observed_declared_names or declared_names
+        )
+
+        logger.warning(
+            "Anthropic tool recovery started: reason=%s original_rid=%s "
+            "recovery_rid=%s",
+            reason.value,
+            original_rid,
+            recovery_rid,
+        )
+
+        async def _run_recovery():
+            async with self._tool_recovery_slots:
+                # Long Claude Code requests can contain hundreds of tools and
+                # a near-full context. Keep the deep copy behind the admission
+                # gate so a failure burst cannot multiply that memory by every
+                # queued retry while only a few decodes are allowed to run.
+                recovery_request = processed_request.model_copy(deep=True)
+                recovery_request.rid = recovery_rid
+                recovery_request.stream = False
+                recovery_request.stream_options = None
+                recovery_request.n = 1
+                recovery_request.max_tokens = min(
+                    recovery_request.max_tokens,
+                    self._tool_recovery_max_tokens,
+                )
+                recovery_request.session_id = None
+                recovery_request.session_params = None
+
+                if original_named_tool is not None:
+                    # The caller's named choice is authoritative even if
+                    # malformed output mentioned a different declared tool.
+                    recovery_request.tools = [
+                        tool
+                        for tool in (recovery_request.tools or [])
+                        if tool.function.name == original_named_tool
+                    ]
+                elif observed_declared_names:
+                    # Keep recovery inside the exact intent set already
+                    # observed in the unpublished V10 transaction. In auto
+                    # mode, required-any over the full catalog could invent a
+                    # different side-effecting call.
+                    recovery_request.tools = [
+                        tool
+                        for tool in (recovery_request.tools or [])
+                        if tool.function.name in observed_declared_names
+                    ]
+
+                if original_named_tool is not None:
+                    recovery_request.tool_choice = ToolChoice(
+                        type="function",
+                        function=ToolChoiceFuncName(name=original_named_tool),
+                    )
+                elif len(observed_declared_names) == 1:
+                    # A name already parsed into V10's unpublished transaction
+                    # is strong evidence of intent and can safely narrow the
+                    # regeneration.
+                    candidate_tool_name = next(iter(observed_declared_names))
+                    recovery_request.tool_choice = ToolChoice(
+                        type="function",
+                        function=ToolChoiceFuncName(name=candidate_tool_name),
+                    )
+                elif len(observed_declared_names) > 1:
+                    recovery_request.tool_choice = "required"
+                elif not isinstance(recovery_request.tool_choice, ToolChoice):
+                    # Preserve auto mode when intent is unknown. Marking the
+                    # tools strict below gives auto mode a triggered structural
+                    # grammar, but still permits an ordinary final response.
+                    # That response is discarded and recovery fails closed; we
+                    # never invent an arbitrary side-effecting tool call.
+                    recovery_request.tool_choice = (
+                        "required"
+                        if recovery_request.tool_choice == "required"
+                        else "auto"
+                    )
+                for tool in recovery_request.tools or []:
+                    tool.function = tool.function.model_copy(update={"strict": True})
+
+                adapted_request, normalized_request = (
+                    self.openai_serving_chat._convert_to_internal_request(
+                        recovery_request,
+                        raw_request,
+                    )
+                )
+                if any(
+                    getattr(adapted_request, field, None) is not None
+                    for field in (
+                        "bootstrap_host",
+                        "bootstrap_port",
+                        "bootstrap_room",
+                        "disagg_prefill_dp_rank",
+                    )
+                ):
+                    raise ValueError(
+                        "Tool recovery is not supported with PD disaggregation"
+                    )
+                # Header overrides are allowed on the original request, but a
+                # retry must never reuse x-override-rid and collide with deleted
+                # state.
+                adapted_request.rid = recovery_rid
+                adapted_request.received_time = monotonic_time()
+                return await self.openai_serving_chat._handle_non_streaming_request(
+                    adapted_request,
+                    normalized_request,
+                    raw_request,
+                )
+
+        try:
+            response = await asyncio.wait_for(
+                _run_recovery(),
+                timeout=self._tool_recovery_timeout_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            logger.warning(
+                "Anthropic tool recovery timed out: reason=%s recovery_rid=%s "
+                "timeout_s=%d",
+                reason.value,
+                recovery_rid,
+                self._tool_recovery_timeout_s,
+            )
+            abort_request = getattr(
+                getattr(self.openai_serving_chat, "tokenizer_manager", None),
+                "abort_request",
+                None,
+            )
+            if abort_request is not None:
+                try:
+                    abort_request(recovery_rid)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort timed-out Anthropic recovery rid=%s",
+                        recovery_rid,
+                    )
+            return None
+        except Exception as e:
+            logger.exception(
+                "Anthropic tool recovery raised: reason=%s recovery_rid=%s "
+                "exception=%s",
+                reason.value,
+                recovery_rid,
+                type(e).__name__,
+            )
+            return None
+
+        if not isinstance(response, ChatCompletionResponse):
+            logger.warning(
+                "Anthropic tool recovery failed upstream: reason=%s "
+                "recovery_rid=%s response_type=%s",
+                reason.value,
+                recovery_rid,
+                type(response).__name__,
+            )
+            return None
+
+        try:
+            result = self._validated_recovery_calls(
+                response,
+                anthropic_request,
+                recovery_rid,
+                allowed_tool_names,
+            )
+        except MalformedToolCallError as e:
+            logger.warning(
+                "Anthropic tool recovery rejected: reason=%s recovery_rid=%s "
+                "validation=%s",
+                reason.value,
+                recovery_rid,
+                e,
+            )
+            return None
+
+        logger.warning(
+            "Anthropic tool recovery succeeded: reason=%s original_rid=%s "
+            "recovery_rid=%s tool_calls=%d",
+            reason.value,
+            original_rid,
+            recovery_rid,
+            len(result.calls),
+        )
+        return result
 
     async def handle_messages(
         self,
@@ -1095,17 +1580,30 @@ class AnthropicServing:
                     )
                     continue
 
-                # Custom tools always have a validated input_schema
-                # (enforced at Pydantic parse time).
+                # Custom tools always carry an input_schema (enforced at
+                # Pydantic parse time); validate that it is legal JSON Schema
+                # before any prompt is rendered or generation is submitted.
+                try:
+                    Draft202012Validator.check_schema(tool.input_schema)
+                except JSONSchemaError as e:
+                    raise ValueError(
+                        f"Anthropic tool {tool.name!r} has an invalid input_schema"
+                    ) from e
+                function_data = {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.input_schema,
+                }
+                if "strict" in tool.model_fields_set:
+                    # Preserve absence as absence: explicitly serializing
+                    # strict=false changes the DSV4 reference prompt even
+                    # though the Anthropic caller never requested strict use.
+                    function_data["strict"] = tool.strict
                 converted_tools.append(
                     Tool(
                         type="function",
                         defer_loading=tool.defer_loading,
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
+                        function=function_data,
                     )
                 )
 
@@ -1203,7 +1701,25 @@ class AnthropicServing:
 
         # Check for error responses from OpenAI handler
         if not isinstance(response, ChatCompletionResponse):
-            # It's an error response (ORJSONResponse)
+            error_message = _openai_error_message(response)
+            recovery_reason = _classify_tool_recovery_reason(error_message or "")
+            if recovery_reason is not None:
+                recovered = await self._attempt_tool_call_recovery(
+                    processed_request,
+                    anthropic_request,
+                    raw_request,
+                    recovery_reason,
+                    getattr(adapted_request, "rid", None),
+                )
+                if recovered is not None:
+                    anthropic_response = self._response_from_recovery(
+                        recovered,
+                        anthropic_request,
+                    )
+                    return JSONResponse(
+                        content=anthropic_response.model_dump(exclude_none=True)
+                    )
+            # It's an error response (ORJSONResponse).
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response. Model-produced tool calls are validated
@@ -1213,6 +1729,30 @@ class AnthropicServing:
             anthropic_response = self._convert_response(response, anthropic_request)
         except MalformedToolCallError as e:
             logger.warning("Rejecting non-streaming Anthropic tool call: %s", e)
+            candidate_tool_names = tuple(
+                dict.fromkeys(
+                    tool_call.function.name
+                    for choice in response.choices
+                    for tool_call in (choice.message.tool_calls or [])
+                )
+            )
+            recovered = await self._attempt_tool_call_recovery(
+                processed_request,
+                anthropic_request,
+                raw_request,
+                _classify_tool_recovery_reason(str(e))
+                or _ToolRecoveryReason.MALFORMED_ARGUMENTS,
+                getattr(adapted_request, "rid", None),
+                candidate_tool_names,
+            )
+            if recovered is not None:
+                anthropic_response = self._response_from_recovery(
+                    recovered,
+                    anthropic_request,
+                )
+                return JSONResponse(
+                    content=anthropic_response.model_dump(exclude_none=True)
+                )
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -1280,9 +1820,24 @@ class AnthropicServing:
         openai_stream = self.openai_serving_chat._generate_chat_stream(
             adapted_request, processed_request, raw_request
         )
+
+        async def _recover_tool_suffix(
+            reason: _ToolRecoveryReason,
+            candidate_tool_names: tuple[str, ...],
+        ) -> Optional[_AnthropicToolRecoveryResult]:
+            return await self._attempt_tool_call_recovery(
+                processed_request,
+                anthropic_request,
+                raw_request,
+                reason,
+                getattr(adapted_request, "rid", None),
+                candidate_tool_names,
+            )
+
         translation_stream = self._translate_openai_stream(
             openai_stream,
             anthropic_request,
+            tool_recovery_callback=_recover_tool_suffix,
         )
         try:
             async for frame in translation_stream:
@@ -1305,6 +1860,12 @@ class AnthropicServing:
         self,
         openai_stream,
         anthropic_request: AnthropicMessagesRequest,
+        tool_recovery_callback: Optional[
+            Callable[
+                [_ToolRecoveryReason, tuple[str, ...]],
+                Awaitable[Optional[_AnthropicToolRecoveryResult]],
+            ]
+        ] = None,
     ) -> AsyncGenerator[str, None]:
         """Convert OpenAI chat stream to Anthropic event stream."""
         upstream_closed = False
@@ -1344,6 +1905,8 @@ class AnthropicServing:
         pending_segments: list[_PendingAnthropicSegment] = []
         active_tool_call_index: Optional[int] = None
         next_tool_call_index = 0
+        recovery_attempted = False
+        recovery_succeeded = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
         omit_thinking = bool(
@@ -1466,6 +2029,123 @@ class AnthropicServing:
             frames.append(_emit(_build_error_event(error_type, message)))
             frames.append(_emit(MessageStopEvent()))
             return frames
+
+        async def _recover_tool_suffix(
+            reason: _ToolRecoveryReason,
+        ) -> AsyncGenerator[str, None]:
+            """Replace the quarantined suffix with one validated retry result."""
+
+            nonlocal recovery_attempted, recovery_succeeded
+            nonlocal had_content_delta, final_usage
+            recovery_succeeded = False
+            if recovery_attempted or tool_recovery_callback is None:
+                return
+            recovery_attempted = True
+
+            candidate_tool_names = tuple(
+                dict.fromkeys(pending.name for pending in pending_tool_calls.values())
+            )
+
+            # V10 guarantees no buffered tool block or post-tool text has been
+            # published. Abort the failed decode before submitting the fresh
+            # RID so late tokenizer output cannot collide with recovery state.
+            await _close_openai_stream()
+            pending_tool_calls.clear()
+            pending_segments.clear()
+
+            callback_task = asyncio.create_task(
+                tool_recovery_callback(reason, candidate_tool_names)
+            )
+            try:
+                while not callback_task.done():
+                    done, _ = await asyncio.wait(
+                        {callback_task},
+                        timeout=self._tool_recovery_ping_interval_s,
+                    )
+                    if not done:
+                        # Anthropic permits ping events at any point in an SSE
+                        # response after message_start. Before message_start,
+                        # use a standards-compliant SSE comment heartbeat so we
+                        # preserve event ordering and can still report accurate
+                        # prompt usage when recovery returns.
+                        if message_started:
+                            yield _emit(PingEvent())
+                        else:
+                            yield ": anthropic-tool-recovery\n\n"
+                recovered = callback_task.result()
+            except asyncio.CancelledError:
+                if not callback_task.done():
+                    callback_task.cancel()
+                    try:
+                        await callback_task
+                    except asyncio.CancelledError:
+                        pass
+                raise
+            except Exception:
+                logger.exception(
+                    "Anthropic tool recovery callback failed: reason=%s",
+                    reason.value,
+                )
+                return
+            finally:
+                # ``aclose()`` injects GeneratorExit while this generator may
+                # be suspended at a ping yield. Cancellation cleanup therefore
+                # belongs in ``finally``, not only the CancelledError branch,
+                # or a client disconnect can orphan the retry decode.
+                if not callback_task.done():
+                    callback_task.cancel()
+                    await asyncio.gather(callback_task, return_exceptions=True)
+            if recovered is None:
+                return
+
+            for frame in _ensure_message_started(recovered.usage):
+                yield frame
+            for event in _close_content_block_events():
+                yield _emit(event)
+
+            for call in recovered.calls:
+                for event in _ensure_content_block_events(
+                    "tool_use",
+                    ToolUseBlock(
+                        id=call.id,
+                        name=call.name,
+                        input={},
+                    ),
+                    force_new=True,
+                ):
+                    yield _emit(event)
+                yield _emit(
+                    ContentBlockDeltaEvent(
+                        index=content_block_index,
+                        delta=InputJsonDelta(partial_json=call.argument_json),
+                    )
+                )
+                for event in _close_content_block_events():
+                    yield _emit(event)
+                had_content_delta = True
+
+            recovered_usage = _anthropic_usage_from_openai(
+                recovered.usage,
+                include_input=False,
+                include_output=True,
+            )
+            original_output_tokens = (
+                final_usage.output_tokens
+                if final_usage is not None and final_usage.output_tokens is not None
+                else 0
+            )
+            recovered_output_tokens = recovered_usage.output_tokens or 0
+            final_usage = AnthropicUsage(
+                output_tokens=original_output_tokens + recovered_output_tokens
+            )
+            yield _emit(
+                MessageDeltaEvent(
+                    delta=AnthropicMessageEndDelta(stop_reason="tool_use"),
+                    usage=final_usage,
+                )
+            )
+            yield _emit(MessageStopEvent())
+            recovery_succeeded = True
 
         def _pending_tool_has_following_text(
             pending: _PendingAnthropicToolCall,
@@ -1631,6 +2311,14 @@ class AnthropicServing:
                 raise
             except MalformedToolCallError as e:
                 logger.warning("Malformed DeepSeek tool-call output: %s", e)
+                recovery_reason = (
+                    _classify_tool_recovery_reason(str(e))
+                    or _ToolRecoveryReason.MALFORMED_PROTOCOL
+                )
+                async for frame in _recover_tool_suffix(recovery_reason):
+                    yield frame
+                if recovery_succeeded:
+                    return
                 await _close_openai_stream()
                 for frame in _flush_on_error("api_error", str(e)):
                     yield frame
@@ -1669,6 +2357,12 @@ class AnthropicServing:
                         "OpenAI stream ended before buffered tool calls received "
                         "a terminal finish reason"
                     )
+                    async for frame in _recover_tool_suffix(
+                        _ToolRecoveryReason.INCOMPLETE_STREAM
+                    ):
+                        yield frame
+                    if recovery_succeeded:
+                        return
                     for frame in _flush_on_error(
                         "api_error", "Incomplete tool-call stream"
                     ):
@@ -1733,6 +2427,12 @@ class AnthropicServing:
                         error_type,
                         error_message,
                     )
+                    recovery_reason = _classify_tool_recovery_reason(error_message)
+                    if recovery_reason is not None:
+                        async for frame in _recover_tool_suffix(recovery_reason):
+                            yield frame
+                        if recovery_succeeded:
+                            return
                     await _close_openai_stream()
                     for frame in _flush_on_error(error_type, error_message):
                         yield frame
@@ -1801,6 +2501,31 @@ class AnthropicServing:
                 and (delta.content is None or delta.content == "")
             ):
                 continue
+
+            # Reasoning is valid only before tool-call protocol begins. If a
+            # corrupted stream reopens reasoning after a tool fragment, keep
+            # that entire suffix quarantined and replace it through the same
+            # bounded recovery path instead of publishing reordered content.
+            if delta.reasoning_content and pending_tool_calls:
+                logger.warning(
+                    "Reasoning resumed after tool-call stream began; "
+                    "failing Anthropic stream closed: rid=%s "
+                    "pending_segments=%s",
+                    chunk.id,
+                    _pending_segment_kinds(),
+                )
+                async for frame in _recover_tool_suffix(
+                    _ToolRecoveryReason.STREAM_ORDERING
+                ):
+                    yield frame
+                if recovery_succeeded:
+                    return
+                await _close_openai_stream()
+                for frame in _flush_on_error(
+                    "api_error", "Invalid tool-call stream ordering"
+                ):
+                    yield frame
+                return
 
             # Handle reasoning content deltas
             if delta.reasoning_content:
@@ -1904,6 +2629,12 @@ class AnthropicServing:
                         active_tool_call_index,
                         _pending_segment_kinds(),
                     )
+                    async for frame in _recover_tool_suffix(
+                        _ToolRecoveryReason.STREAM_ORDERING
+                    ):
+                        yield frame
+                    if recovery_succeeded:
+                        return
                     await _close_openai_stream()
                     for frame in _flush_on_error("api_error", tool_stream_error):
                         yield frame
@@ -1934,6 +2665,12 @@ class AnthropicServing:
                         "Tool-call stream terminated with finish_reason=%r",
                         choice.finish_reason,
                     )
+                    async for frame in _recover_tool_suffix(
+                        _ToolRecoveryReason.INCOMPLETE_STREAM
+                    ):
+                        yield frame
+                    if recovery_succeeded:
+                        return
                     await _close_openai_stream()
                     for frame in _flush_on_error(
                         "api_error", "Incomplete tool-call stream"
@@ -1944,6 +2681,14 @@ class AnthropicServing:
                     pending_events = _commit_pending_content_events()
                 except MalformedToolCallError as e:
                     logger.warning("Rejecting buffered Anthropic tool call: %s", e)
+                    recovery_reason = (
+                        _classify_tool_recovery_reason(str(e))
+                        or _ToolRecoveryReason.MALFORMED_ARGUMENTS
+                    )
+                    async for frame in _recover_tool_suffix(recovery_reason):
+                        yield frame
+                    if recovery_succeeded:
+                        return
                     await _close_openai_stream()
                     for frame in _flush_on_error("api_error", str(e)):
                         yield frame
@@ -1955,6 +2700,13 @@ class AnthropicServing:
                 if finish_reason == "stop":
                     finish_reason = "tool_calls"
 
+        if pending_tool_calls:
+            async for frame in _recover_tool_suffix(
+                _ToolRecoveryReason.INCOMPLETE_STREAM
+            ):
+                yield frame
+            if recovery_succeeded:
+                return
         await _close_openai_stream()
         logger.warning("OpenAI stream ended without a terminal [DONE] event")
         for frame in _flush_on_error("api_error", "Incomplete upstream stream"):
@@ -2039,6 +2791,8 @@ class AnthropicServing:
 
         # Map stop reason
         finish_reason = choice.finish_reason or "stop"
+        if choice.message.tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         if finish_reason not in STOP_REASON_MAP:
             logger.warning(
                 "Unmapped OpenAI finish_reason %r; defaulting to end_turn",

@@ -14,6 +14,7 @@ from pydantic import (
     Discriminator,
     Field,
     NonNegativeInt,
+    StrictBool,
     Tag,
     field_validator,
     model_validator,
@@ -138,6 +139,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: StrictBool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")

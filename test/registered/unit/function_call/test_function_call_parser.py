@@ -1690,9 +1690,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -1745,9 +1745,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertGreater(num_tool_call_chunks, 8)
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -1838,9 +1838,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         # Verify that the no-parameter function was correctly parsed
         self.assertEqual(
@@ -1898,9 +1898,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         # Should still parse correctly even with whitespace-only content
         self.assertEqual(
@@ -2102,9 +2102,9 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -4472,9 +4472,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4514,9 +4514,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4554,9 +4554,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4593,9 +4593,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4630,9 +4630,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         # Should have name but incomplete parameters
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4668,9 +4668,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(accumulated_text, "I'll remember that.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4713,9 +4713,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4763,9 +4763,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4892,6 +4892,57 @@ class TestGetStructureConstraint(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
 
+    def test_deepseekv4_auto_non_strict_remains_unconstrained(self):
+        parser = self._make_parser("deepseekv4", strict=False)
+        self.assertIsNone(parser.get_structure_constraint("auto"))
+
+    def test_deepseekv4_auto_strict_uses_native_parameter_schema(self):
+        parser = self._make_parser("deepseekv4", strict=True)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        serialized = self._constraint_json(result)
+        self.assertIn("<｜DSML｜tool_calls>", serialized)
+        self.assertIn('"city"', serialized)
+
+    def test_deepseekv4_required_non_strict_uses_loose_native_schema(self):
+        parser = self._make_parser("deepseekv4", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertNotIn('"city"', self._constraint_json(result))
+
+    def test_deepseekv4_required_strict_uses_native_parameter_schema(self):
+        parser = self._make_parser("deepseekv4", strict=True)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIn('"city"', self._constraint_json(result))
+
+    def test_strict_auto_grammar_failure_does_not_fall_back_unconstrained(self):
+        parser = self._make_parser("deepseekv4", strict=True)
+        with patch.object(
+            parser.detector,
+            "get_structural_tag",
+            side_effect=RuntimeError("unsupported schema"),
+        ), self.assertRaisesRegex(ValueError, "Failed to build tool-call constraint"):
+            parser.get_structure_constraint("auto")
+
+    def test_strict_auto_missing_grammar_does_not_fall_back_unconstrained(self):
+        parser = self._make_parser("deepseekv4", strict=True)
+        with patch.object(
+            parser.detector,
+            "get_structural_tag",
+            return_value=None,
+        ), patch.object(
+            parser.detector,
+            "supports_structural_tag",
+            return_value=False,
+        ), self.assertRaisesRegex(
+            ValueError, "Failed to build tool-call constraint"
+        ):
+            parser.get_structure_constraint("auto")
+
     def test_qwen25_required_no_strict_returns_structural_tag(self):
         parser = self._make_parser("qwen25", strict=False)
         result = parser.get_structure_constraint("required")
@@ -5017,9 +5068,9 @@ class TestQwen25Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
         return tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5267,9 +5318,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
         return normal_text, tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5308,9 +5359,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(len(tool_calls_by_index), 2)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -5375,9 +5426,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
         self.assertIn("Hello!", normal_text)
         self.assertIn("Let me also check", normal_text)
         self.assertEqual(len(tool_calls_by_index), 2)

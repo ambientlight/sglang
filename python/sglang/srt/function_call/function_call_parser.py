@@ -262,10 +262,11 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
+        strict_constraint_requested = (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        should_constrain_auto = tool_choice == "auto" and strict_constraint_requested
 
         # Highest priority: model-native structural_tag when available.
         try:
@@ -316,6 +317,18 @@ class FunctionCallParser:
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
                 return ("json_schema", json_schema)
+
+            if strict_constraint_requested and (is_required or tool_choice == "auto"):
+                raise ValueError(
+                    "Configured tool-call parser did not produce a strict constraint"
+                )
         except Exception as e:
-            logger.error(f"Error getting structure constraint: {e}")
+            if is_required or should_constrain_auto:
+                # A required/named or explicitly strict request must never
+                # silently degrade to unconstrained sampling. Besides violating
+                # the API contract, that fallback is exactly how malformed
+                # model-native tool protocol reaches the streaming parser.
+                logger.exception("Failed to build required tool-call constraint")
+                raise ValueError("Failed to build tool-call constraint") from e
+            logger.error("Error getting optional structure constraint: %s", e)
             return None

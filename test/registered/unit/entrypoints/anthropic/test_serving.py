@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -16,6 +17,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
 from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
     AnthropicServing,
     _ThinkingSignatureCodec,
+    _ToolRecoveryReason,
 )
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
@@ -114,6 +116,57 @@ class _FakeNonStreamingOpenAI:
         return self._response
 
 
+class _FakeRecoveryOpenAI(_FakeOpenAIServingChat):
+    """Streams one failed attempt, then serves one isolated recovery result."""
+
+    def __init__(self, stream_lines, recovery_response, recovery_delay=0):
+        super().__init__(stream_lines)
+        self.recovery_response = recovery_response
+        self.recovery_delay = recovery_delay
+        self.recovery_cancelled = False
+        self.recovery_requests = []
+        self.recovery_adapted_requests = []
+
+    def _convert_to_internal_request(self, request, raw_request):
+        adapted = SimpleNamespace(rid=request.rid, received_time=None)
+        self.recovery_requests.append(request)
+        self.recovery_adapted_requests.append(adapted)
+        return adapted, request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        if self.recovery_delay:
+            try:
+                await asyncio.sleep(self.recovery_delay)
+            except asyncio.CancelledError:
+                self.recovery_cancelled = True
+                raise
+        return self.recovery_response
+
+
+class _FakeSequentialNonStreamingOpenAI:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+        self.tokenizer_manager = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=None)
+        )
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, request, raw_request):
+        adapted = SimpleNamespace(rid=request.rid, received_time=None)
+        self.requests.append(request)
+        return adapted, request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        return self.responses.pop(0)
+
+
 def _chunk(choices=None, usage=None):
     data = {
         "id": "chatcmpl-test",
@@ -135,11 +188,69 @@ def _choice(delta, finish_reason=None):
     }
 
 
+def _tool_response(
+    name="Bash",
+    arguments='{"command":"pwd"}',
+    finish_reason="tool_calls",
+):
+    return ChatCompletionResponse.model_validate(
+        {
+            "id": "chatcmpl-recovery",
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "discarded retry prose",
+                        "reasoning_content": "discarded retry reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call_recovered",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 7,
+                "total_tokens": 27,
+            },
+        }
+    )
+
+
 async def _collect_anthropic_events(serving, anthropic_request):
     events = []
     async for sse in serving._generate_anthropic_stream(
         adapted_request=object(),
         processed_request=object(),
+        anthropic_request=anthropic_request,
+        raw_request=object(),
+    ):
+        for line in sse.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
+
+
+async def _collect_anthropic_events_with_processed_request(
+    serving,
+    anthropic_request,
+    processed_request,
+    rid="original-rid",
+):
+    events = []
+    async for sse in serving._generate_anthropic_stream(
+        adapted_request=SimpleNamespace(rid=rid),
+        processed_request=processed_request,
         anthropic_request=anthropic_request,
         raw_request=object(),
     ):
@@ -708,6 +819,58 @@ class TestAnthropicServing(unittest.TestCase):
                 }
             )
 
+    def test_anthropic_tool_strict_is_preserved_without_inventing_false(self):
+        for label, strict_value in (
+            ("absent", None),
+            ("false", False),
+            ("true", True),
+        ):
+            with self.subTest(label=label):
+                tool = {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                }
+                if label != "absent":
+                    tool["strict"] = strict_value
+                request = self._declared_tool_request(tool)
+                chat_request = self._serving()._convert_to_chat_completion_request(
+                    request
+                )
+                function = chat_request.tools[0].function
+                self.assertIs(function.strict, bool(strict_value))
+                serialized = function.model_dump(exclude_unset=True)
+                if label == "absent":
+                    self.assertNotIn("strict", serialized)
+                else:
+                    self.assertIs(serialized["strict"], strict_value)
+
+    def test_anthropic_tool_strict_requires_json_boolean(self):
+        for invalid in ("true", "false", 0, 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self._declared_tool_request(
+                    {
+                        "name": "Read",
+                        "strict": invalid,
+                        "input_schema": {"type": "object", "properties": {}},
+                    }
+                )
+
+    def test_invalid_declared_json_schema_is_rejected_before_generation(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "not-a-json-type"}},
+                },
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "invalid input_schema"):
+            self._serving()._convert_to_chat_completion_request(request)
+
     def test_non_streaming_openai_error_response_is_forwarded(self):
         serving = AnthropicServing(_FakeNonStreamingErrorOpenAI())
         chat_request = ChatCompletionRequest(
@@ -1000,7 +1163,7 @@ class TestAnthropicServing(unittest.TestCase):
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("malformed tool-call arguments", error["error"]["message"])
 
-    def test_v10_stream_rejects_v9_schema_failures_before_tool_start(self):
+    def test_v11_stream_publishes_non_strict_schema_failures(self):
         schemas_and_arguments = {
             "bash_missing_command": (
                 {
@@ -1079,14 +1242,616 @@ class TestAnthropicServing(unittest.TestCase):
                     tool["name"],
                     json.dumps(arguments),
                 )
+                self.assertFalse(any(event["type"] == "error" for event in events))
+                streamed_arguments = "".join(
+                    event["delta"]["partial_json"]
+                    for event in events
+                    if event["type"] == "content_block_delta"
+                    and event["delta"].get("type") == "input_json_delta"
+                )
+                self.assertEqual(json.loads(streamed_arguments), arguments)
                 self.assertEqual(
-                    [event["type"] for event in events],
-                    ["message_start", "error", "message_stop"],
+                    next(event for event in events if event["type"] == "message_delta")[
+                        "delta"
+                    ]["stop_reason"],
+                    "tool_use",
                 )
-                self.assertIn(
-                    "declared schema",
-                    events[1]["error"]["message"],
+
+    def test_v11_stream_publishes_explicit_false_schema_failure(self):
+        tool = {
+            "name": "Read",
+            "strict": False,
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        }
+        events = self._single_tool_stream_events(
+            self._declared_tool_request(tool),
+            "Read",
+            "{}",
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v11_stream_rejects_explicit_strict_schema_failure(self):
+        tool = {
+            "name": "Read",
+            "strict": True,
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        }
+        events = self._single_tool_stream_events(
+            self._declared_tool_request(tool),
+            "Read",
+            "{}",
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertIn("declared schema", events[1]["error"]["message"])
+
+    def test_v11_malformed_protocol_recovers_named_tool_suffix_once(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        )
+        upstream_error = {
+            "error": {
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "Valid prefix."})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_unpublished",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertEqual(len(fake.recovery_requests), 1)
+        recovery_request = fake.recovery_requests[0]
+        self.assertFalse(recovery_request.stream)
+        self.assertNotEqual(recovery_request.rid, "original-rid")
+        self.assertEqual(recovery_request.tool_choice.function.name, "Bash")
+        self.assertTrue(recovery_request.tools[0].function.strict)
+        payload = json.dumps(events)
+        self.assertIn("Valid prefix.", payload)
+        self.assertNotIn("call_unpublished", payload)
+        self.assertNotIn("discarded retry", payload)
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "Bash")
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v11_unknown_tool_intent_recovery_stays_auto_and_fails_closed(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        text_response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-recovery-text",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 1,
+                    "total_tokens": 21,
+                },
+            }
+        )
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            text_response,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(fake.recovery_requests[0].tool_choice, "auto")
+        self.assertTrue(fake.recovery_requests[0].tools[0].function.strict)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_v11_ordering_failure_uses_transactional_recovery(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_order",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "unpublished trailing text"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": "{}"},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertNotIn("unpublished trailing text", json.dumps(events))
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(fake.recovery_requests[0].tool_choice.function.name, "Bash")
+
+    def test_v11_post_tool_reasoning_stays_quarantined_during_recovery(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_before_bad_reasoning",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "reasoning_content": (
+                                    "unpublished reasoning after tool protocol"
+                                )
+                            }
+                        )
+                    ]
+                ),
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        payload = json.dumps(events)
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertNotIn("call_before_bad_reasoning", payload)
+        self.assertNotIn("unpublished reasoning after tool protocol", payload)
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertIn("call_recovered", payload)
+
+    def test_v11_recovery_deep_copy_waits_for_concurrency_admission(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI([], _tool_response())
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+        original_model_copy = ChatCompletionRequest.model_copy
+        copy_calls = []
+
+        def _tracked_model_copy(instance, *args, **kwargs):
+            copy_calls.append(instance)
+            return original_model_copy(instance, *args, **kwargs)
+
+        async def _exercise_gate():
+            serving._tool_recovery_slots = asyncio.Semaphore(0)
+            with patch.object(
+                ChatCompletionRequest,
+                "model_copy",
+                new=_tracked_model_copy,
+            ):
+                recovery_task = asyncio.create_task(
+                    serving._attempt_tool_call_recovery(
+                        processed_request,
+                        request,
+                        object(),
+                        _ToolRecoveryReason.MALFORMED_PROTOCOL,
+                        "original-rid",
+                        ("Bash",),
+                    )
                 )
+                await asyncio.sleep(0)
+                self.assertFalse(recovery_task.done())
+                self.assertEqual(copy_calls, [])
+
+                serving._tool_recovery_slots.release()
+                return await recovery_task
+
+        result = asyncio.run(_exercise_gate())
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(copy_calls), 1)
+        self.assertEqual(len(fake.recovery_requests), 1)
+
+    def test_v11_recovery_rid_cannot_share_original_abort_prefix(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI([], _tool_response())
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        async def _exercise_prefix_collision():
+            with patch(
+                "sglang.srt.entrypoints.anthropic.serving.uuid.uuid4",
+                side_effect=[
+                    SimpleNamespace(hex="a" * 32),
+                    SimpleNamespace(hex="b" * 32),
+                ],
+            ):
+                return await serving._attempt_tool_call_recovery(
+                    processed_request,
+                    request,
+                    object(),
+                    _ToolRecoveryReason.MALFORMED_PROTOCOL,
+                    "a",
+                    ("Bash",),
+                )
+
+        result = asyncio.run(_exercise_prefix_collision())
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.recovery_rid.startswith("b" * 32))
+        self.assertFalse(result.recovery_rid.startswith("a"))
+        self.assertEqual(fake.recovery_adapted_requests[0].rid, result.recovery_rid)
+
+    def test_v11_recovery_emits_keepalive_ping_while_waiting(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "prefix"})]),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+            recovery_delay=0.03,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_ping_interval_s = 0.005
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertTrue(any(event["type"] == "ping" for event in events))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+
+    def test_v11_recovery_timeout_cancels_retry_and_fails_closed(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "prefix"})]),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+            recovery_delay=0.05,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_timeout_s = 0.01
+        serving._tool_recovery_ping_interval_s = 0.003
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertTrue(fake.recovery_cancelled)
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertTrue(any(event["type"] == "ping" for event in events))
+        self.assertEqual(events[-2]["type"], "error")
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_v11_client_disconnect_during_keepalive_cancels_recovery(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            _tool_response(),
+            recovery_delay=0.1,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_ping_interval_s = 0.005
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        async def _consume_one_ping_then_disconnect():
+            stream = serving._generate_anthropic_stream(
+                adapted_request=SimpleNamespace(rid="original-rid"),
+                processed_request=processed_request,
+                anthropic_request=request,
+                raw_request=object(),
+            )
+            first = await stream.__anext__()
+            self.assertEqual(first, ": anthropic-tool-recovery\n\n")
+            await stream.aclose()
+
+        asyncio.run(_consume_one_ping_then_disconnect())
+
+        self.assertTrue(fake.recovery_cancelled)
+        self.assertTrue(fake.stream_closed)
+
+    def test_v11_recovery_rejects_length_truncated_tool_result(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            _tool_response(finish_reason="length"),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_v11_recovered_schema_mismatch_follows_original_strictness(self):
+        schema = {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        }
+        response = _tool_response(name="Read", arguments="{}")
+        serving = self._serving()
+
+        non_strict = self._declared_tool_request(
+            {"name": "Read", "strict": False, "input_schema": schema}
+        )
+        recovered = serving._validated_recovery_calls(
+            response,
+            non_strict,
+            "recovery-rid",
+            {"Read"},
+        )
+        self.assertEqual(recovered.calls[0].tool_input, {})
+
+        strict = self._declared_tool_request(
+            {"name": "Read", "strict": True, "input_schema": schema}
+        )
+        with self.assertRaisesRegex(MalformedToolCallError, "declared schema"):
+            serving._validated_recovery_calls(
+                response,
+                strict,
+                "recovery-rid",
+                {"Read"},
+            )
+
+    def test_v11_named_choice_overrides_conflicting_observed_candidate(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            tool_choice={"type": "tool", "name": "Read"},
+        )
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_wrong_intent",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(name="Read", arguments='{"file_path":"/tmp/a"}'),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        recovery_request = fake.recovery_requests[0]
+        self.assertEqual(recovery_request.tool_choice.function.name, "Read")
+        self.assertEqual(
+            [tool.function.name for tool in recovery_request.tools],
+            ["Read"],
+        )
+        self.assertFalse(any(event["type"] == "error" for event in events))
 
     def test_v10_stream_rejects_undeclared_v9_tool_before_tool_start(self):
         request = self._declared_tool_request(
@@ -1176,10 +1941,65 @@ class TestAnthropicServing(unittest.TestCase):
             "tool_use",
         )
 
-    def test_v10_parallel_calls_are_atomic_when_one_schema_is_invalid(self):
+    def test_v11_parallel_non_strict_schema_mismatch_is_published(self):
         request = self._declared_tool_request(
             {
                 "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_valid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": '{"file_path":"/tmp/a"}',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_invalid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_starts = [
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(tool_starts), 2)
+
+    def test_v11_parallel_strict_calls_remain_atomic_on_schema_failure(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "strict": True,
                 "input_schema": {
                     "type": "object",
                     "properties": {"file_path": {"type": "string"}},
@@ -2400,7 +3220,7 @@ class TestAnthropicServing(unittest.TestCase):
         ):
             self._serving()._convert_response(response)
 
-    def test_v10_non_streaming_schema_failure_returns_anthropic_api_error(self):
+    def test_v11_non_streaming_non_strict_schema_failure_is_published(self):
         response = ChatCompletionResponse.model_validate(
             {
                 "id": "chatcmpl-v10-schema",
@@ -2454,9 +3274,80 @@ class TestAnthropicServing(unittest.TestCase):
             serving._handle_non_streaming(chat_request, request, object())
         )
         payload = json.loads(result.body)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(payload["content"][0]["input"], {})
+
+    def test_v11_non_streaming_explicit_strict_schema_failure_is_error(self):
+        response = _tool_response(name="Read", arguments="{}")
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(response))
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "strict": True,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "read"}],
+        )
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
         self.assertEqual(result.status_code, 500)
         self.assertEqual(payload["error"]["type"], "api_error")
         self.assertIn("declared schema", payload["error"]["message"])
+
+    def test_v11_non_streaming_malformed_protocol_recovers_full_response(self):
+        initial_error = JSONResponse(
+            status_code=500,
+            content={
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            },
+        )
+        fake = _FakeSequentialNonStreamingOpenAI(
+            [initial_error, _tool_response(finish_reason="stop")]
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(fake.requests), 2)
+        self.assertTrue(fake.requests[1].tools[0].function.strict)
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(
+            [block["type"] for block in payload["content"]],
+            ["thinking", "text", "tool_use"],
+        )
 
     def test_error_response_does_not_leak_exception_name(self):
         """``error.type`` must stay in Anthropic's documented literal set."""
