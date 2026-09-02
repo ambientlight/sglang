@@ -4,6 +4,7 @@ import re
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -24,12 +25,24 @@ _GENERIC_INVOKE_RE = re.compile(
 _DSML_TAG_PREFIX_RE = re.compile(r"</?｜DSML｜")
 _DSML_TAG_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _DSML_INVOKE_OPEN_RE = re.compile(r'<｜DSML｜invoke\s+name="[^"<>\r\n]+"\s*(?:>|/>)')
+_DSML_PROTOCOL_PADDING = " \t\r\n\f\v\u200b\ufeff"
 _DSML_PROTOCOL_IN_VALUE_RE = re.compile(
     r"</｜DSML｜[A-Za-z_][A-Za-z0-9_-]*\s*>"
     r"|</?｜DSML｜(?:tool_calls|function_calls|invoke|parameter)\b"
     r"|</parameter>\s*<\]"
     r"|<[^<>\r\n]{0,8}DSML｜(?:tool_calls|function_calls|invoke|parameter)\b"
 )
+
+
+def _strip_dsml_protocol_padding(text: str) -> str:
+    """Strip whitespace plus invisible padding only at DSML boundaries.
+
+    U+200B and U+FEFF are semantically empty between tags but Python's
+    ``str.strip`` does not remove them. Inside a parameter value they remain
+    ordinary argument data.
+    """
+
+    return text.strip(_DSML_PROTOCOL_PADDING)
 
 
 def find_malformed_generic_tool_call(
@@ -421,7 +434,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         2. Direct JSON: { "key": "value" }
         """
         # First, try to parse as direct JSON (new format)
-        invoke_content_stripped = invoke_content.strip()
+        invoke_content_stripped = _strip_dsml_protocol_padding(invoke_content)
         if invoke_content_stripped.startswith("{"):
             if allow_partial:
                 # Once a complete object exists, freeze the argument at its JSON
@@ -459,9 +472,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         last_match_end = 0
         for match in param_matches:
-            if (
-                not allow_partial
-                and invoke_content[last_match_end : match.start()].strip()
+            if not allow_partial and _strip_dsml_protocol_padding(
+                invoke_content[last_match_end : match.start()]
             ):
                 self._raise_malformed_tool_protocol()
 
@@ -520,7 +532,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     except (json.JSONDecodeError, MalformedJSON, ValueError):
                         parameters[param_name] = param_value.strip()
 
-        if not allow_partial and invoke_content[last_match_end:].strip():
+        if not allow_partial and _strip_dsml_protocol_padding(
+            invoke_content[last_match_end:]
+        ):
             self._raise_malformed_tool_protocol()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -566,10 +580,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._raise_malformed_tool_protocol()
                 cursor = section_start
                 for invoke_match in section_matches:
-                    if text[cursor : invoke_match.start()].strip():
+                    if _strip_dsml_protocol_padding(
+                        text[cursor : invoke_match.start()]
+                    ):
                         self._raise_malformed_tool_protocol()
                     cursor = invoke_match.end()
-                if text[cursor:section_end].strip():
+                if _strip_dsml_protocol_padding(text[cursor:section_end]):
                     self._raise_malformed_tool_protocol()
 
             for invoke_match in invoke_matches:
@@ -636,7 +652,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # DSML tool-call delimiter.  Hold it until the next chunk resolves
             # that ambiguity.  ``finish`` flushes it for a non-tool response,
             # while a confirmed tool call consumes it as wrapper structure.
-            if current_text and current_text.isspace():
+            if current_text and not _strip_dsml_protocol_padding(current_text):
                 return StreamingParseResult()
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
@@ -800,7 +816,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 and not self._ends_with_partial_generic_invoke(postamble)
             ):
                 if (
-                    postamble.isspace()
+                    not _strip_dsml_protocol_padding(postamble)
                     and self.current_tool_id != -1
                     and self.prev_tool_call_arr
                 ):
@@ -862,7 +878,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # If we successfully parsed tool calls, the buffer holds only
         # trailing whitespace or closing tags — don't emit those.
         if self.current_tool_id != -1 and self.prev_tool_call_arr:
-            remainder = buffered.replace(self.eot_token, "").strip()
+            remainder = _strip_dsml_protocol_padding(
+                buffered.replace(self.eot_token, "")
+            )
             if remainder:
                 logger.warning(
                     "DeepSeek tool-call protocol left trailing unparsed content"
@@ -891,7 +909,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def _trim_tool_boundary_prefix(text: str) -> str:
         """Remove structural padding before a tool call without losing prose."""
         text = text.removesuffix("\n\n")
-        return "" if text and text.isspace() else text
+        return "" if text and not _strip_dsml_protocol_padding(text) else text
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

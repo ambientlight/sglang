@@ -1,6 +1,11 @@
 import asyncio
+import json
+import pathlib
+import stat
+import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from openai.types.responses import (
     ResponseOutputMessage,
@@ -8,20 +13,31 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import (
+    collect_stream_events,
+    engine_chunk,
+    event_payloads,
+    event_types,
+    make_serving,
+)
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
+    _RecoveredResponseToolCall,
+    _ResponsesToolRecoveryResult,
     _should_emit_normal_text_as_message,
 )
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import MalformedToolCallError, ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -187,8 +203,12 @@ class ChatToolForwardingTestCase(CustomTestCase):
             store=False,
         )
 
-        messages, request_prompts, engine_prompts, processed = asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        messages, request_prompts, engine_prompts, processed, chat_request = (
+            asyncio.run(
+                serving._make_request(
+                    request, None, serving.tokenizer_manager.tokenizer
+                )
+            )
         )
 
         self.assertEqual(messages, [{"role": "user", "content": "call the tool"}])
@@ -198,6 +218,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(seen["tool_choice"], "required")
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
+        self.assertEqual(chat_request.max_tokens, request.max_output_tokens)
 
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
@@ -232,7 +253,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
             store=False,
         )
 
-        _, request_prompts, engine_prompts, _ = asyncio.run(
+        _, request_prompts, engine_prompts, _, _ = asyncio.run(
             serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
         )
 
@@ -839,6 +860,457 @@ class ShouldEmitNormalTextTestCase(CustomTestCase):
         self.assertFalse(emit("\n", any_tool_call_in_progress=True))
         self.assertTrue(emit("\n", any_tool_call_in_progress=False))
         self.assertTrue(emit("hello", any_tool_call_in_progress=True))
+
+
+class ResponsesToolTransactionTestCase(CustomTestCase):
+    @staticmethod
+    def _request(*, strict=False):
+        return ResponsesRequest(
+            model="x",
+            input="run pwd",
+            request_id="resp_transaction",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "Bash",
+                    "strict": strict,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        )
+
+    @staticmethod
+    def _parser_patch(serving, *, parse_side_effect, parse_end=("", [])):
+        serving.tool_call_parser = "deepseekv4"
+        parser = Mock()
+        parser.detector.supports_structural_tag.return_value = True
+        parser.parse_stream_chunk.side_effect = parse_side_effect
+        parser.parse_stream_end.return_value = parse_end
+        return patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser",
+            return_value=parser,
+        )
+
+    @staticmethod
+    def _run(serving, request, chunks, *, processed_request=None):
+        async def result_generator():
+            for chunk in chunks:
+                yield chunk
+
+        async def collect():
+            return await collect_stream_events(
+                serving.responses_stream_generator_non_harmony(
+                    request,
+                    sampling_params={},
+                    result_generator=result_generator(),
+                    model_name="x",
+                    tokenizer=Mock(),
+                    request_metadata=RequestResponseMetadata(
+                        request_id=request.request_id
+                    ),
+                    require_reasoning=False,
+                    processed_request=processed_request,
+                )
+            )
+
+        return asyncio.run(collect())
+
+    @staticmethod
+    def _event_pairs(events):
+        return list(zip(event_types(events), event_payloads(events)))
+
+    def test_malformed_suffix_never_publishes_buffered_tool_fragments(self):
+        serving = make_serving()
+        request = self._request()
+        parsed_call = ToolCallItem(
+            tool_index=0,
+            name="Bash",
+            parameters='{"command":"pwd"}',
+        )
+        parser_patch = self._parser_patch(
+            serving,
+            parse_side_effect=[
+                ("", [parsed_call]),
+                MalformedToolCallError(
+                    "Model emitted malformed DeepSeek tool-call protocol"
+                ),
+            ],
+        )
+
+        with parser_patch:
+            events = self._run(
+                serving,
+                request,
+                [engine_chunk("first"), engine_chunk("firstbad")],
+            )
+
+        pairs = self._event_pairs(events)
+        types = [event_type for event_type, _ in pairs]
+        self.assertEqual(
+            types, ["response.created", "response.in_progress", "response.failed"]
+        )
+        failed = pairs[-1][1]["response"]
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["output"], [])
+        self.assertEqual(failed["error"]["sglang_code"], "malformed_protocol")
+        self.assertIn("malformed DeepSeek", failed["error"]["message"])
+        self.assertEqual(
+            [payload["sequence_number"] for _, payload in pairs],
+            list(range(len(pairs))),
+        )
+
+    def test_malformed_suffix_is_replaced_by_one_validated_recovery(self):
+        serving = make_serving()
+        serving._tool_recovery_enabled = True
+        request = self._request()
+        parsed_call = ToolCallItem(
+            tool_index=0,
+            name="Bash",
+            parameters='{"command":"damaged"}',
+        )
+        recovered = _ResponsesToolRecoveryResult(
+            calls=(
+                _RecoveredResponseToolCall(
+                    call_id="call_recovered",
+                    name="Bash",
+                    arguments='{"command":"pwd"}',
+                ),
+            ),
+            usage=UsageInfo(
+                prompt_tokens=11,
+                completion_tokens=3,
+                total_tokens=14,
+            ),
+            recovery_rid="fresh_toolrecovery",
+        )
+        serving._attempt_response_tool_recovery = AsyncMock(return_value=recovered)
+        parser_patch = self._parser_patch(
+            serving,
+            parse_side_effect=[
+                ("", [parsed_call]),
+                MalformedToolCallError(
+                    "Model emitted malformed DeepSeek tool-call protocol"
+                ),
+            ],
+        )
+
+        with parser_patch:
+            events = self._run(
+                serving,
+                request,
+                [engine_chunk("first"), engine_chunk("firstbad", 2)],
+                processed_request=Mock(),
+            )
+
+        pairs = self._event_pairs(events)
+        types = [event_type for event_type, _ in pairs]
+        self.assertNotIn("response.failed", types)
+        self.assertEqual(types[-1], "response.completed")
+        self.assertEqual(types.count("response.output_item.added"), 1)
+        self.assertEqual(types.count("response.function_call_arguments.delta"), 1)
+        completed = pairs[-1][1]["response"]
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(len(completed["output"]), 1)
+        self.assertEqual(completed["output"][0]["name"], "Bash")
+        self.assertEqual(
+            json.loads(completed["output"][0]["arguments"]),
+            {"command": "pwd"},
+        )
+        self.assertEqual(completed["usage"]["input_tokens"], 16)
+        self.assertEqual(completed["usage"]["output_tokens"], 5)
+        callback = serving._attempt_response_tool_recovery.await_args
+        self.assertEqual(callback.args[3], "malformed_protocol")
+        self.assertEqual(callback.args[5], ("Bash",))
+
+    def test_strict_schema_mismatch_fails_before_any_tool_event(self):
+        serving = make_serving()
+        request = self._request(strict=True)
+        parser_patch = self._parser_patch(
+            serving,
+            parse_side_effect=[
+                (
+                    "",
+                    [
+                        ToolCallItem(
+                            tool_index=0,
+                            name="Bash",
+                            parameters="{}",
+                        )
+                    ],
+                )
+            ],
+        )
+
+        with parser_patch:
+            events = self._run(serving, request, [engine_chunk("call", finish=True)])
+
+        pairs = self._event_pairs(events)
+        self.assertEqual(
+            [event_type for event_type, _ in pairs],
+            ["response.created", "response.in_progress", "response.failed"],
+        )
+        error = pairs[-1][1]["response"]["error"]
+        self.assertEqual(error["sglang_code"], "schema_mismatch")
+        self.assertIn("declared schema", error["message"])
+
+    def test_recovery_closes_visible_prefix_before_publishing_recovered_tool(self):
+        serving = make_serving()
+        serving._tool_recovery_enabled = True
+        request = self._request()
+        serving._attempt_response_tool_recovery = AsyncMock(
+            return_value=_ResponsesToolRecoveryResult(
+                calls=(
+                    _RecoveredResponseToolCall(
+                        call_id="call_recovered",
+                        name="Bash",
+                        arguments='{"command":"pwd"}',
+                    ),
+                ),
+                usage=UsageInfo(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                ),
+                recovery_rid="fresh_toolrecovery",
+            )
+        )
+        parser_patch = self._parser_patch(
+            serving,
+            parse_side_effect=[
+                ("visible prefix", []),
+                MalformedToolCallError(
+                    "Model emitted malformed DeepSeek tool-call protocol"
+                ),
+            ],
+        )
+
+        with parser_patch:
+            events = self._run(
+                serving,
+                request,
+                [engine_chunk("first"), engine_chunk("firstbad")],
+                processed_request=Mock(),
+            )
+
+        pairs = self._event_pairs(events)
+        message_done = next(
+            index
+            for index, (event_type, payload) in enumerate(pairs)
+            if event_type == "response.output_item.done"
+            and payload["item"]["type"] == "message"
+        )
+        tool_added = next(
+            index
+            for index, (event_type, payload) in enumerate(pairs)
+            if event_type == "response.output_item.added"
+            and payload["item"]["type"] == "function_call"
+        )
+        self.assertLess(message_done, tool_added)
+        completed_output = pairs[-1][1]["response"]["output"]
+        self.assertEqual(
+            [item["type"] for item in completed_output],
+            ["message", "function_call"],
+        )
+        callback = serving._attempt_response_tool_recovery.await_args
+        self.assertEqual(callback.args[5], ())
+
+    def test_non_strict_schema_mismatch_preserves_responses_api_semantics(self):
+        serving = make_serving()
+        request = self._request(strict=False)
+        parser_patch = self._parser_patch(
+            serving,
+            parse_side_effect=[
+                (
+                    "",
+                    [
+                        ToolCallItem(
+                            tool_index=0,
+                            name="Bash",
+                            parameters="{}",
+                        )
+                    ],
+                )
+            ],
+        )
+
+        with parser_patch:
+            events = self._run(serving, request, [engine_chunk("call", finish=True)])
+
+        pairs = self._event_pairs(events)
+        self.assertEqual(pairs[-1][0], "response.completed")
+        self.assertEqual(pairs[-1][1]["response"]["output"][0]["arguments"], "{}")
+
+    def test_failure_dump_contains_only_bounded_raw_pre_parser_tail(self):
+        serving = make_serving()
+        serving.tool_call_parser = "deepseekv4"
+        serving._tool_failure_tail_chars = 12
+        request = self._request()
+        parser = Mock()
+        parser.detector.supports_structural_tag.return_value = True
+        parser.parse_stream_chunk.side_effect = MalformedToolCallError(
+            "Model emitted malformed DeepSeek tool-call protocol"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            serving._tool_failure_dump_dir = pathlib.Path(directory)
+            with patch(
+                "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser",
+                return_value=parser,
+            ):
+                self._run(
+                    serving,
+                    request,
+                    [engine_chunk("prefix-sensitive-tail")],
+                )
+
+            dumps = list(pathlib.Path(directory).glob("*.json"))
+            self.assertEqual(len(dumps), 1)
+            payload = json.loads(dumps[0].read_text())
+            self.assertEqual(payload["request_id"], request.request_id)
+            self.assertEqual(payload["tail_chars"], 12)
+            self.assertTrue(
+                "prefix-sensitive-tail".endswith(payload["raw_pre_parser_tail"])
+            )
+            self.assertEqual(
+                stat.S_IMODE(dumps[0].stat().st_mode),
+                0o600,
+            )
+
+    def test_recovery_is_fresh_bounded_strict_and_intent_constrained(self):
+        serving = make_serving()
+        serving._tool_recovery_enabled = True
+        request = self._request()
+        chat_tools = serving._response_tools_to_chat_tools(request)
+        chat_tools.append(
+            chat_tools[0].model_copy(
+                update={
+                    "function": chat_tools[0].function.model_copy(
+                        update={"name": "Read"}
+                    )
+                }
+            )
+        )
+        processed_request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "run pwd"}],
+            tools=chat_tools,
+            tool_choice="auto",
+            stream=True,
+            max_tokens=50000,
+            session_id="shared-session",
+            session_params={"offset": 1},
+        )
+        adapted = SimpleNamespace(
+            rid="header-overridden-rid",
+            received_time=None,
+            bootstrap_host=None,
+            bootstrap_port=None,
+            bootstrap_room=None,
+            disagg_prefill_dp_rank=None,
+        )
+        serving._convert_to_internal_request = Mock(
+            return_value=(adapted, processed_request)
+        )
+        serving._handle_non_streaming_request = AsyncMock(
+            return_value=ChatCompletionResponse.model_validate(
+                {
+                    "id": "chatcmpl-recovery",
+                    "model": "x",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_recovered",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":"pwd"}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                }
+            )
+        )
+
+        result = asyncio.run(
+            serving._attempt_response_tool_recovery(
+                processed_request,
+                request,
+                None,
+                "malformed_protocol",
+                "original-rid",
+                ("Bash",),
+            )
+        )
+
+        self.assertIsNotNone(result)
+        recovery_request = serving._convert_to_internal_request.call_args.args[0]
+        self.assertFalse(recovery_request.stream)
+        self.assertIsNone(recovery_request.session_id)
+        self.assertIsNone(recovery_request.session_params)
+        self.assertEqual(recovery_request.max_tokens, 8192)
+        self.assertEqual(
+            [tool.function.name for tool in recovery_request.tools],
+            ["Bash"],
+        )
+        self.assertTrue(recovery_request.tools[0].function.strict)
+        self.assertEqual(recovery_request.tool_choice.function.name, "Bash")
+        self.assertNotEqual(recovery_request.rid, "original-rid")
+        self.assertTrue(recovery_request.rid.endswith("_toolrecovery"))
+        self.assertEqual(adapted.rid, recovery_request.rid)
+
+
+class ResponsesGenerationCleanupTestCase(CustomTestCase):
+    def test_closing_outer_stream_closes_suspended_tokenizer_stream(self):
+        serving = make_serving()
+        child_closed = False
+
+        async def child_stream():
+            nonlocal child_closed
+            try:
+                yield {"text": "partial", "meta_info": {}}
+                await asyncio.Future()
+            finally:
+                child_closed = True
+
+        serving.tokenizer_manager.generate_request = Mock(
+            side_effect=lambda *_: child_stream()
+        )
+        adapted = SimpleNamespace()
+        context = SimpleContext()
+
+        async def consume_then_close():
+            outer = serving._generate_with_builtin_tools(
+                "rid",
+                [],
+                adapted,
+                {},
+                context,
+            )
+            await outer.__anext__()
+            await outer.aclose()
+
+        asyncio.run(consume_then_close())
+        self.assertTrue(child_closed)
 
 
 class EnginePassthroughTestCase(CustomTestCase):

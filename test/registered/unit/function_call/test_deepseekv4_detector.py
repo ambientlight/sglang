@@ -673,6 +673,48 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(json.loads(streamed_args), {"city": "find /tmp and /opt"})
         self.assertNotIn(DSML, streamed_args)
 
+    def test_invisible_boundary_padding_is_normalized_without_relaxing_payloads(self):
+        padding = "\u200b\ufeff"
+        text = (
+            f"<{DSML}tool_calls>{padding}"
+            f'<{DSML}invoke name="get_weather">{padding}'
+            f'{_param("city", "true", "San\u200bFrancisco")}{padding}'
+            f"</{DSML}invoke>{padding}</{DSML}tool_calls>"
+        )
+
+        one_shot = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        detector = DeepSeekV4Detector()
+        streamed_results = [
+            detector.parse_streaming_increment(character, self.tools)
+            for character in text
+        ]
+        streamed_results.append(detector.finish(self.tools))
+
+        self.assertEqual(one_shot.normal_text, "")
+        self.assertEqual(
+            json.loads(one_shot.calls[0].parameters),
+            {"city": "San\u200bFrancisco"},
+        )
+        self.assertEqual(
+            "".join(result.normal_text for result in streamed_results),
+            "",
+        )
+        streamed_arguments = "".join(
+            call.parameters for result in streamed_results for call in result.calls
+        )
+        self.assertEqual(
+            json.loads(streamed_arguments),
+            {"city": "San\u200bFrancisco"},
+        )
+
+    def test_invisible_padding_around_direct_json_object_is_normalized(self):
+        padding = "\u200b\ufeff"
+        text = _wrapped(_invoke("get_weather", f'{padding}{{"city":"SF"}}{padding}'))
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
     def test_explicit_unknown_tool_forwarding_setting_is_preserved(self):
         text = _wrapped(_invoke("future_tool", ""))
         with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
