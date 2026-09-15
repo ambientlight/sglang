@@ -62,3 +62,20 @@ and rejection, encoder contracts, lifecycle cleanup and launcher policy. The
 benchmark repo additionally compares all five pinned publisher prompt goldens.
 Hardware and live endpoint qualification are separate gates, not inferred from
 these unit tests.
+
+## Legacy endpoint promotion
+
+The boot wrapper accepts `SERVED_MODEL_NAME` and the existing `SERVER_PORT` to
+publish V4.1 behind the V12-compatible `deepseek-v4-flash` alias on port 8000.
+`REQUIRE_API_KEY=0` explicitly restores V12's no-backend-key access; the default
+remains authenticated for other deployments. Both startup smoke calls and health
+checks follow these settings. Parser/encoder selection remains native V4.1,
+independent of the public model alias; no kernel or serving implementation is
+replaced by this deployment change.
+
+The promoted Compose profile selects context 524288, container `dsv41`, and
+`unless-stopped`, preserving TP4/EP4, 2048-token prefill, memory fraction 0.85,
+eight request slots, and DSPARK block 5. The V12 durable thinking key is retained
+for legacy history compatibility: its signed payload binds to the public model
+alias, not cryptographically to the checkpoint revision. The embedding model
+and previous inference containers remain stopped for rollback.

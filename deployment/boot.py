@@ -1,4 +1,4 @@
-"""Pinned 0xSero boot with operator sampling defaults and metrics only.
+"""Pinned 0xSero boot with deployment identity, auth and sampling controls.
 
 Source: 45f538a18569420721e00e37353f9a7e1af7e5da/boot.py.
 Hardware, checkpoint verification, startup and baseline smoke logic are unchanged.
@@ -23,6 +23,16 @@ REVISION = 'fb2764a5cf321eaa5070ca8f9e892818f477c16d'
 MODEL = Path(os.environ.get('MODEL_PATH','/models/DeepSeek-V4.1-Flash'))
 STATE = Path(os.environ.get('STATE_PATH','/state'))
 PORT = int(os.environ.get('SERVER_PORT','8010'))
+
+def served_model_name():
+    value = os.environ.get('SERVED_MODEL_NAME', 'deepseek-v4.1-flash').strip()
+    assert value, 'SERVED_MODEL_NAME must not be empty'
+    return value
+
+def require_api_key():
+    value = os.environ.get('REQUIRE_API_KEY', '1')
+    assert value in ('0', '1'), 'REQUIRE_API_KEY must be 0 or 1'
+    return value == '1'
 
 def save(name, value):
     STATE.mkdir(parents=True,exist_ok=True)
@@ -82,22 +92,25 @@ def key():
     return path.read_text().strip()
 
 def request(path,payload=None,timeout=10):
+    headers = {'Content-Type':'application/json'}
+    if require_api_key():
+        headers['Authorization'] = 'Bearer '+key()
     req = urllib.request.Request(f'http://127.0.0.1:{PORT}'+path,
-        headers={'Authorization':'Bearer '+key(),'Content-Type':'application/json'},
+        headers=headers,
         data=None if payload is None else json.dumps(payload).encode())
     with urllib.request.urlopen(req,timeout=timeout) as response:
         body = response.read()
         return json.loads(body) if body else {'status':response.status}
 
 def smoke():
-    result = request('/v1/chat/completions',dict(model='deepseek-v4.1-flash',temperature=0,
+    result = request('/v1/chat/completions',dict(model=served_model_name(),temperature=0,
         chat_template_kwargs={'thinking':False},messages=[dict(role='user',
         content='What is 19 + 23? Reply only with the number.')]),timeout=300)
     choice = result['choices'][0]
     assert choice['message']['content'].strip() == '42' and choice['finish_reason'] == 'stop', result
     save('smoke.json',result)
     print('Fresh inference passed: 19 + 23 = 42',flush=True)
-    common = dict(model='deepseek-v4.1-flash',temperature=0,
+    common = dict(model=served_model_name(),temperature=0,
                   chat_template_kwargs={'thinking':False})
     structured = request('/v1/chat/completions',dict(common,
         messages=[dict(role='user',content='Return an object whose answer is the integer 42.')],
@@ -158,7 +171,7 @@ def serve():
         mem = dict(line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())
         available = int(mem['MemAvailable'].split()[0])*1024
         assert available >= needed, f'RAM offload needs at least {needed/2**30:.1f} GiB available; found {available/2**30:.1f}. Use nvme mode on a 128 GiB host.'
-    args = ['--model-path',str(MODEL),'--served-model-name','deepseek-v4.1-flash',
+    args = ['--model-path',str(MODEL),'--served-model-name',served_model_name(),
         '--trust-remote-code','--load-format','safetensors','--tp','4','--ep-size','4',
         '--attention-backend','dsv4','--moe-runner-backend','flashinfer_mxfp4',
         '--mem-fraction-static',str(memory_fraction),'--chunked-prefill-size',str(chunk),
@@ -175,10 +188,15 @@ def serve():
                                '{"temperature":1.0,"top_p":0.95,"max_new_tokens":32768}')
     assert isinstance(json.loads(preferred), dict), 'Preferred sampling must be a JSON object'
     args.extend(['--preferred-sampling-params',preferred,'--enable-metrics'])
-    save('launch.json',{'revision':REVISION,'offload_mode':mode,'args':args,'gpus':gpu})
+    authenticated = require_api_key()
+    save('launch.json',{'revision':REVISION,'offload_mode':mode,'args':args,'gpus':gpu,
+                        'require_api_key':authenticated,'served_model_name':served_model_name()})
     secret = key()
     env = dict(os.environ,DSV41_SOURCE=str(MODEL))
-    process = subprocess.Popen([sys.executable,'-m','sglang.launch_server',*args,'--api-key',secret],
+    command = [sys.executable,'-m','sglang.launch_server',*args]
+    if authenticated:
+        command.extend(['--api-key',secret])
+    process = subprocess.Popen(command,
         env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)
     def stop(*_):
         if process.poll() is None:
@@ -200,7 +218,8 @@ def serve():
         else:
             raise RuntimeError('Server failed to become healthy; inspect container logs')
         smoke()
-        print(f'Ready: authenticated API on port {PORT}. Key is in /state/api-key.',flush=True)
+        auth_description = 'API key required' if authenticated else 'no backend API key (legacy compatibility)'
+        print(f'Ready: {served_model_name()} on port {PORT}; {auth_description}.',flush=True)
         return process.wait()
     finally:
         stop()
