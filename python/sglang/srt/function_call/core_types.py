@@ -1,7 +1,11 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from pydantic import BaseModel
+
+
+class MalformedToolCallError(ValueError):
+    """Model output used tool-like syntax that the configured parser cannot trust."""
 
 
 class ToolCallItem(BaseModel):
@@ -17,6 +21,11 @@ class StreamingParseResult(BaseModel):
 
     normal_text: str = ""
     calls: List[ToolCallItem] = []
+    # Some model protocols can emit ordinary text both before and after tool
+    # calls in one decoded increment. ``normal_text`` plus ``calls`` cannot
+    # preserve that ordering, so detectors may provide the exact sequence here.
+    # Callers that do not understand it can keep using the legacy fields.
+    ordered_items: Optional[List[Union[str, ToolCallItem]]] = None
 
 
 @dataclass

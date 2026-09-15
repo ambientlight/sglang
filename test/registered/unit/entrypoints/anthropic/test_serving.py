@@ -1,0 +1,3689 @@
+import asyncio
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
+
+from fastapi.responses import JSONResponse  # noqa: E402
+from jinja2 import Environment  # noqa: E402
+from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicMessage,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+    AnthropicServing,
+    _ThinkingSignatureCodec,
+    _ToolRecoveryReason,
+)
+from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+)
+from sglang.srt.function_call.core_types import MalformedToolCallError  # noqa: E402
+from sglang.srt.parser.template_detection import (  # noqa: E402
+    detect_inline_system_support,
+)
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class _FakeOpenAIServingChat:
+    native_reasoning_history = False
+
+    def __init__(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
+        self.stream_lines = stream_lines or []
+        self.stream_closed = False
+        self.apply_reasoning_calls: list[bool] = []
+        self.chat_encoding_spec = chat_encoding_spec
+        self.tokenizer_manager = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=chat_template)
+        )
+
+    def supports_native_reasoning_history(self):
+        return self.native_reasoning_history
+
+    def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
+        async def _gen():
+            try:
+                for line in self.stream_lines:
+                    if isinstance(line, BaseException):
+                        raise line
+                    yield line
+            finally:
+                self.stream_closed = True
+
+        return _gen()
+
+    def apply_reasoning_enabled(self, chat_request, enabled):
+        self.apply_reasoning_calls.append(enabled)
+
+    def wrap_reasoning_history(self, text):
+        return f"<think>\n{text}\n</think>"
+
+
+class _FakeNonStreamingErrorOpenAI:
+    """Returns a configurable error response from the OpenAI handler."""
+
+    def __init__(self, status_code=400, body=None, content=None):
+        self._status_code = status_code
+        self._body = body
+        self._content = content
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return SimpleNamespace(), chat_request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        if self._body is not None:
+            # Build a response object exposing raw bytes via `.body`.
+            return SimpleNamespace(status_code=self._status_code, body=self._body)
+        return JSONResponse(
+            status_code=self._status_code,
+            content=self._content
+            or {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "context length exceeded",
+                }
+            },
+        )
+
+
+class _FakeNonStreamingOpenAI:
+    """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
+
+    def __init__(self, response):
+        self._response = response
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return SimpleNamespace(), chat_request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        return self._response
+
+
+class _FakeRecoveryOpenAI(_FakeOpenAIServingChat):
+    """Streams one failed attempt, then serves one isolated recovery result."""
+
+    def __init__(self, stream_lines, recovery_response, recovery_delay=0):
+        super().__init__(stream_lines)
+        self.recovery_response = recovery_response
+        self.recovery_delay = recovery_delay
+        self.recovery_cancelled = False
+        self.recovery_requests = []
+        self.recovery_adapted_requests = []
+
+    def _convert_to_internal_request(self, request, raw_request):
+        adapted = SimpleNamespace(rid=request.rid, received_time=None)
+        self.recovery_requests.append(request)
+        self.recovery_adapted_requests.append(adapted)
+        return adapted, request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        if self.recovery_delay:
+            try:
+                await asyncio.sleep(self.recovery_delay)
+            except asyncio.CancelledError:
+                self.recovery_cancelled = True
+                raise
+        return self.recovery_response
+
+
+class _FakeSequentialNonStreamingOpenAI:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+        self.tokenizer_manager = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=None)
+        )
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, request, raw_request):
+        adapted = SimpleNamespace(rid=request.rid, received_time=None)
+        self.requests.append(request)
+        return adapted, request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        return self.responses.pop(0)
+
+
+def _chunk(choices=None, usage=None):
+    data = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test-model",
+        "choices": choices or [],
+    }
+    if usage is not None:
+        data["usage"] = usage
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def _choice(delta, finish_reason=None):
+    return {
+        "index": 0,
+        "delta": delta,
+        "finish_reason": finish_reason,
+    }
+
+
+def _tool_response(
+    name="Bash",
+    arguments='{"command":"pwd"}',
+    finish_reason="tool_calls",
+):
+    return ChatCompletionResponse.model_validate(
+        {
+            "id": "chatcmpl-recovery",
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "discarded retry prose",
+                        "reasoning_content": "discarded retry reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call_recovered",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 7,
+                "total_tokens": 27,
+            },
+        }
+    )
+
+
+async def _collect_anthropic_events(serving, anthropic_request):
+    events = []
+    async for sse in serving._generate_anthropic_stream(
+        adapted_request=object(),
+        processed_request=object(),
+        anthropic_request=anthropic_request,
+        raw_request=object(),
+    ):
+        for line in sse.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
+
+
+async def _collect_anthropic_events_with_processed_request(
+    serving,
+    anthropic_request,
+    processed_request,
+    rid="original-rid",
+):
+    events = []
+    async for sse in serving._generate_anthropic_stream(
+        adapted_request=SimpleNamespace(rid=rid),
+        processed_request=processed_request,
+        anthropic_request=anthropic_request,
+        raw_request=object(),
+    ):
+        for line in sse.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
+
+
+class TestAnthropicServing(unittest.TestCase):
+    # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
+    INLINE_SYSTEM_TEMPLATE = (
+        "{%- for message in messages %}"
+        "{{- message.role }}: {{ message.content }}\n"
+        "{%- endfor %}"
+    )
+    GLM_TOOL_RESULT_TEMPLATE = """
+{%- for message in messages if message.role == "tool" -%}
+{%- if loop.first -%}<|observation|>{%- endif -%}
+{%- if message.content is string -%}
+<tool_response>{{ message.content }}</tool_response>
+{%- elif message.content.0.type == "tool_reference" -%}
+<tool_response><tools>
+{%- for reference in message.content -%}
+{%- for tool in tools if tool.function.name == reference.name -%}
+{{ tool.function.name }}
+{%- endfor -%}
+{%- endfor -%}
+</tools></tool_response>
+{%- endif -%}
+{%- endfor -%}
+"""
+
+    def _serving(
+        self,
+        stream_lines=None,
+        chat_template=None,
+        chat_encoding_spec=None,
+        with_thinking_codec=False,
+    ):
+        serving = AnthropicServing(
+            _FakeOpenAIServingChat(stream_lines, chat_template, chat_encoding_spec)
+        )
+        if with_thinking_codec:
+            serving._thinking_signature_codec = _ThinkingSignatureCodec(b"k" * 32)
+        return serving
+
+    def _anthropic_request(self, **overrides):
+        data = {
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        }
+        data.update(overrides)
+        return AnthropicMessagesRequest.model_validate(data)
+
+    def _declared_tool_request(self, *tools, **overrides):
+        """Build a streaming request with explicit client-tool schemas."""
+        declarations = []
+        for tool in tools:
+            if isinstance(tool, str):
+                declarations.append(
+                    {
+                        "name": tool,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": True,
+                        },
+                    }
+                )
+            else:
+                declarations.append(tool)
+        return self._anthropic_request(tools=declarations, **overrides)
+
+    def _single_tool_stream_events(self, request, name, arguments):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_capture",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        return asyncio.run(_collect_anthropic_events(serving, request))
+
+    def _tool_result_request(self, content, tools=None):
+        overrides = {
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": content,
+                        }
+                    ],
+                }
+            ],
+        }
+        if tools is not None:
+            overrides["tools"] = tools
+        return self._anthropic_request(**overrides)
+
+    def test_stream_closes_tool_block_before_text_delta(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ': "sglang"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "done"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        block_events = [
+            (event["type"], event.get("content_block", {}).get("type"))
+            for event in events
+            if event["type"].startswith("content_block")
+        ]
+
+        self.assertEqual(
+            block_events,
+            [
+                ("content_block_start", "tool_use"),
+                ("content_block_delta", None),
+                ("content_block_delta", None),
+                ("content_block_stop", None),
+                ("content_block_start", "text"),
+                ("content_block_delta", None),
+                ("content_block_stop", None),
+            ],
+        )
+
+        text_delta = [
+            event
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"].get("type") == "text_delta"
+        ][0]
+        self.assertEqual(text_delta["index"], 1)
+
+    def test_stream_late_tool_argument_fails_closed(self):
+        """Never turn an impossible argument continuation into malformed success."""
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "between tools"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ': "sglang"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        errors = [event for event in events if event["type"] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"]["type"], "api_error")
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("between tools", json.dumps(events))
+        self.assertNotIn("message_delta", [event["type"] for event in events])
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_stream_reasoning_content_uses_thinking_block(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"reasoning_content": "think first"})]),
+                _chunk([_choice({"content": "answer"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        content_events = [
+            event for event in events if event["type"].startswith("content_block")
+        ]
+
+        self.assertEqual(content_events[0]["content_block"]["type"], "thinking")
+        # Signature is absent (None and excluded) — never emit empty
+        # string, which would fail downstream Anthropic signature verifiers.
+        self.assertNotIn("signature", content_events[0]["content_block"])
+        self.assertEqual(content_events[1]["delta"]["type"], "thinking_delta")
+        self.assertEqual(content_events[1]["delta"]["thinking"], "think first")
+        # No empty signature_delta event between thinking_delta and content_block_stop.
+        self.assertEqual(content_events[2]["type"], "content_block_stop")
+        self.assertEqual(content_events[3]["content_block"]["type"], "text")
+        # Confirm no signature_delta event was emitted in the entire stream.
+        sig_deltas = [
+            event
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event.get("delta", {}).get("type") == "signature_delta"
+        ]
+        self.assertEqual(sig_deltas, [])
+
+    def test_stream_omitted_thinking_is_sealed_not_emitted(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"reasoning_content": "hidden analysis"})]),
+                _chunk([_choice({"content": "answer"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ],
+            with_thinking_codec=True,
+        )
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "omitted"}
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        content_events = [
+            event for event in events if event["type"].startswith("content_block")
+        ]
+        self.assertEqual(
+            content_events[0]["content_block"],
+            {"type": "thinking", "thinking": ""},
+        )
+        self.assertFalse(
+            any(
+                event.get("delta", {}).get("type") == "thinking_delta"
+                for event in content_events
+            )
+        )
+        signature_event = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "signature_delta"
+        )
+        signature = signature_event["delta"]["signature"]
+        self.assertTrue(signature.startswith("sglang_thinking_v1."))
+        self.assertEqual(
+            serving._thinking_signature_codec.unseal(signature, "test-model"),
+            "hidden analysis",
+        )
+        text_delta = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "text_delta"
+        )
+        self.assertEqual(text_delta["delta"]["text"], "answer")
+
+    def test_stream_usage_subtracts_cache_read_and_omits_final_input_tokens(self):
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 4},
+        }
+        final_usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": 4},
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "hi"})], usage=usage),
+                _chunk([], usage=final_usage),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        message_start = [event for event in events if event["type"] == "message_start"][
+            0
+        ]
+        message_delta = [event for event in events if event["type"] == "message_delta"][
+            0
+        ]
+
+        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 6)
+        self.assertEqual(
+            message_start["message"]["usage"]["cache_read_input_tokens"], 4
+        )
+        self.assertNotIn("input_tokens", message_delta["usage"])
+        self.assertEqual(message_delta["usage"]["output_tokens"], 2)
+
+    def test_non_streaming_usage_subtracts_cache_read_tokens(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "prompt_tokens_details": {"cached_tokens": 4},
+                },
+            }
+        )
+
+        anthropic_response = self._serving()._convert_response(response)
+
+        self.assertEqual(anthropic_response.usage.input_tokens, 6)
+        self.assertEqual(anthropic_response.usage.output_tokens, 2)
+        self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 4)
+
+    def test_tool_result_search_result_content_is_flattened(self):
+        request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_1",
+                                "content": [
+                                    {
+                                        "type": "search_result",
+                                        "title": "SGLang docs",
+                                        "source": "https://docs.sglang.ai",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "Anthropic API notes",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = [
+            msg
+            for msg in chat_request.model_dump()["messages"]
+            if msg["role"] == "tool"
+        ][0]
+
+        self.assertIn("SGLang docs", tool_message["content"])
+        self.assertIn("https://docs.sglang.ai", tool_message["content"])
+        self.assertIn("Anthropic API notes", tool_message["content"])
+
+    def test_mixed_tool_reference_content_preserves_part_order(self):
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "text", "text": "Ready"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual([message["role"] for message in messages], ["tool"] * 3)
+        self.assertEqual(
+            [message["tool_call_id"] for message in messages], ["call_1"] * 3
+        )
+        self.assertEqual(messages[0]["content"], "Tool loaded: Bash")
+        self.assertEqual(
+            messages[1]["content"],
+            [{"type": "tool_reference", "name": "Bash"}],
+        )
+        self.assertEqual(messages[2]["content"], "Ready")
+
+    def test_mixed_tool_reference_content_renders_text_and_schema(self):
+        template = Environment().from_string(self.GLM_TOOL_RESULT_TEMPLATE)
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "Tool loaded: Bash"},
+                {"type": "tool_reference", "tool_name": "Bash"},
+            ],
+            tools=[
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": True,
+                }
+            ],
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        payload = chat_request.model_dump(exclude_none=True)
+        prompt = template.render(messages=payload["messages"], tools=payload["tools"])
+
+        self.assertIn("<tool_response>Tool loaded: Bash</tool_response>", prompt)
+        self.assertIn("<tools>Bash</tools>", prompt)
+        self.assertEqual(prompt.count("<|observation|>"), 1)
+
+    def test_reference_only_tool_result_remains_one_message(self):
+        request = self._tool_result_request(
+            [
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "tool_reference", "tool_name": "Read"},
+            ]
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "tool_reference", "name": "Bash"},
+                {"type": "tool_reference", "name": "Read"},
+            ],
+        )
+
+    def test_tool_result_error_bit_survives_anthropic_conversion(self):
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "permission denied",
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ],
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = next(
+            message for message in chat_request.messages if message.role == "tool"
+        )
+        self.assertIs(tool_message.is_error, True)
+
+    def test_builtin_web_search_tool_without_schema_is_skipped(self):
+        request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "search sglang"}],
+                "tools": [{"name": "web_search", "type": "web_search_20250305"}],
+                "tool_choice": {"type": "auto"},
+            }
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+
+        self.assertIsNone(chat_request.tools)
+        self.assertEqual(chat_request.tool_choice, "none")
+
+    def test_custom_tool_without_schema_is_rejected(self):
+        # With the discriminated union, an AnthropicCustomTool variant must
+        # carry an input_schema. The check fires at request-parse time
+        # (Pydantic raises ValidationError, a subclass of ValueError).
+        with self.assertRaisesRegex(ValueError, "input_schema"):
+            AnthropicMessagesRequest.model_validate(
+                {
+                    "model": "test-model",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "call a tool"}],
+                    "tools": [{"name": "custom_without_schema"}],
+                }
+            )
+
+    def test_anthropic_tool_strict_is_preserved_without_inventing_false(self):
+        for label, strict_value in (
+            ("absent", None),
+            ("false", False),
+            ("true", True),
+        ):
+            with self.subTest(label=label):
+                tool = {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                }
+                if label != "absent":
+                    tool["strict"] = strict_value
+                request = self._declared_tool_request(tool)
+                chat_request = self._serving()._convert_to_chat_completion_request(
+                    request
+                )
+                function = chat_request.tools[0].function
+                self.assertIs(function.strict, bool(strict_value))
+                serialized = function.model_dump(exclude_unset=True)
+                if label == "absent":
+                    self.assertNotIn("strict", serialized)
+                else:
+                    self.assertIs(serialized["strict"], strict_value)
+
+    def test_anthropic_tool_strict_requires_json_boolean(self):
+        for invalid in ("true", "false", 0, 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self._declared_tool_request(
+                    {
+                        "name": "Read",
+                        "strict": invalid,
+                        "input_schema": {"type": "object", "properties": {}},
+                    }
+                )
+
+    def test_invalid_declared_json_schema_is_rejected_before_generation(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "not-a-json-type"}},
+                },
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "invalid input_schema"):
+            self._serving()._convert_to_chat_completion_request(request)
+
+    def test_non_streaming_openai_error_response_is_forwarded(self):
+        serving = AnthropicServing(_FakeNonStreamingErrorOpenAI())
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        anthropic_request = self._anthropic_request(stream=False)
+
+        response = asyncio.run(
+            serving._handle_non_streaming(chat_request, anthropic_request, object())
+        )
+        payload = json.loads(response.body)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["message"], "context length exceeded")
+
+    # ------------------------------------------------------------------
+    # Edge-case coverage added in the review-fix pass
+    # ------------------------------------------------------------------
+
+    def test_stream_text_then_tool_use_closes_text_block(self):
+        """Text deltas followed by tool_use must close the text block before opening tool_use index."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": "Hello"})]),
+                _chunk([_choice({"content": " world"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "search",
+                                            "arguments": '{"q":"hello"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        block_events = [
+            (event["type"], event.get("content_block", {}).get("type"))
+            for event in events
+            if event["type"].startswith("content_block")
+        ]
+        # text block (start, delta, delta, stop) then tool_use (start, delta, stop)
+        self.assertEqual(block_events[0], ("content_block_start", "text"))
+        text_stop_idx = next(
+            i for i, ev in enumerate(block_events) if ev == ("content_block_stop", None)
+        )
+        tool_start_idx = next(
+            i
+            for i, ev in enumerate(block_events)
+            if ev == ("content_block_start", "tool_use")
+        )
+        self.assertLess(text_stop_idx, tool_start_idx)
+
+    def test_stream_tool_use_without_arguments_is_not_empty_completion(self):
+        """A zero-argument tool call is valid content even without input_json_delta."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "ping", "arguments": ""},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "ping")
+        message_delta = next(
+            event for event in events if event["type"] == "message_delta"
+        )
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
+    def test_stream_no_usage_chunk_emits_error_event(self):
+        """Stream that yields only [DONE] (no content delta) must surface as an error event."""
+        serving = self._serving(["data: [DONE]\n\n"])
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        types = [event["type"] for event in events]
+        # Sequence: message_start, error, message_stop
+        self.assertEqual(types, ["message_start", "error", "message_stop"])
+        error_event = events[1]
+        self.assertEqual(error_event["error"]["type"], "api_error")
+        self.assertIn("no content", error_event["error"]["message"].lower())
+
+    def test_stream_malformed_tool_protocol_emits_api_error(self):
+        serving = self._serving(
+            [MalformedToolCallError("Model emitted malformed tool protocol")]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertTrue(serving.openai_serving_chat.stream_closed)
+        self.assertEqual(events[1]["error"]["type"], "api_error")
+
+    def test_stream_client_close_closes_nested_openai_stream(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"content": "first"})]),
+                _chunk([_choice({"content": "never consumed"})]),
+            ]
+        )
+
+        async def _consume_one_then_close():
+            stream = serving._generate_anthropic_stream(
+                adapted_request=object(),
+                processed_request=object(),
+                anthropic_request=self._anthropic_request(),
+                raw_request=object(),
+            )
+            await stream.__anext__()
+            await stream.aclose()
+
+        asyncio.run(_consume_one_then_close())
+
+        self.assertTrue(serving.openai_serving_chat.stream_closed)
+
+    def test_stream_parser_error_after_tool_name_does_not_publish_empty_tool(self):
+        """A rejected invoke must not leave a tool_use block on the wire."""
+        upstream_error = {
+            "error": {
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            }
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(
+                event["type"] == "content_block_start"
+                and event["content_block"]["type"] == "tool_use"
+                for event in events
+            )
+        )
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_stream_invalid_buffered_tool_json_fails_before_tool_start(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_json",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_stream_invalid_buffered_tool_json_does_not_release_trailing_text(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_json_with_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "<tooladapter>corrupt"})]),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("corrupt", json.dumps(events))
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_v11_stream_publishes_non_strict_schema_failures(self):
+        schemas_and_arguments = {
+            "bash_missing_command": (
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                {"description": "show files"},
+            ),
+            "read_missing_file_path": (
+                {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "offset": {"type": "integer"},
+                        },
+                        "required": ["file_path"],
+                    },
+                },
+                {"offset": 10},
+            ),
+            "edit_missing_new_string": (
+                {
+                    "name": "Edit",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                },
+                {"file_path": "/tmp/a", "old_string": "old"},
+            ),
+            "wrong_required_type": (
+                {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+                {"file_path": 42},
+            ),
+            "unknown_property": (
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                {"command": "pwd", "protocol_fragment": "damaged"},
+            ),
+        }
+
+        for failure_class, (tool, arguments) in schemas_and_arguments.items():
+            with self.subTest(failure_class=failure_class):
+                request = self._declared_tool_request(tool)
+                events = self._single_tool_stream_events(
+                    request,
+                    tool["name"],
+                    json.dumps(arguments),
+                )
+                self.assertFalse(any(event["type"] == "error" for event in events))
+                streamed_arguments = "".join(
+                    event["delta"]["partial_json"]
+                    for event in events
+                    if event["type"] == "content_block_delta"
+                    and event["delta"].get("type") == "input_json_delta"
+                )
+                self.assertEqual(json.loads(streamed_arguments), arguments)
+                self.assertEqual(
+                    next(event for event in events if event["type"] == "message_delta")[
+                        "delta"
+                    ]["stop_reason"],
+                    "tool_use",
+                )
+
+    def test_v11_stream_publishes_explicit_false_schema_failure(self):
+        tool = {
+            "name": "Read",
+            "strict": False,
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        }
+        events = self._single_tool_stream_events(
+            self._declared_tool_request(tool),
+            "Read",
+            "{}",
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v11_stream_rejects_explicit_strict_schema_failure(self):
+        tool = {
+            "name": "Read",
+            "strict": True,
+            "input_schema": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        }
+        events = self._single_tool_stream_events(
+            self._declared_tool_request(tool),
+            "Read",
+            "{}",
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertIn("declared schema", events[1]["error"]["message"])
+
+    def test_v11_malformed_protocol_recovers_named_tool_suffix_once(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        )
+        upstream_error = {
+            "error": {
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "Valid prefix."})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_unpublished",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertEqual(len(fake.recovery_requests), 1)
+        recovery_request = fake.recovery_requests[0]
+        self.assertFalse(recovery_request.stream)
+        self.assertNotEqual(recovery_request.rid, "original-rid")
+        self.assertEqual(recovery_request.tool_choice.function.name, "Bash")
+        self.assertTrue(recovery_request.tools[0].function.strict)
+        payload = json.dumps(events)
+        self.assertIn("Valid prefix.", payload)
+        self.assertNotIn("call_unpublished", payload)
+        self.assertNotIn("discarded retry", payload)
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "Bash")
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v11_unknown_tool_intent_recovery_stays_auto_and_fails_closed(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        text_response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-recovery-text",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 1,
+                    "total_tokens": 21,
+                },
+            }
+        )
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            text_response,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(fake.recovery_requests[0].tool_choice, "auto")
+        self.assertTrue(fake.recovery_requests[0].tools[0].function.strict)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_v11_ordering_failure_uses_transactional_recovery(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bad_order",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "unpublished trailing text"})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": "{}"},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertNotIn("unpublished trailing text", json.dumps(events))
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(fake.recovery_requests[0].tool_choice.function.name, "Bash")
+
+    def test_v11_post_tool_reasoning_stays_quarantined_during_recovery(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_before_bad_reasoning",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "reasoning_content": (
+                                    "unpublished reasoning after tool protocol"
+                                )
+                            }
+                        )
+                    ]
+                ),
+            ],
+            _tool_response(),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        payload = json.dumps(events)
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        self.assertNotIn("call_before_bad_reasoning", payload)
+        self.assertNotIn("unpublished reasoning after tool protocol", payload)
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertIn("call_recovered", payload)
+
+    def test_v11_recovery_deep_copy_waits_for_concurrency_admission(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI([], _tool_response())
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+        original_model_copy = ChatCompletionRequest.model_copy
+        copy_calls = []
+
+        def _tracked_model_copy(instance, *args, **kwargs):
+            copy_calls.append(instance)
+            return original_model_copy(instance, *args, **kwargs)
+
+        async def _exercise_gate():
+            serving._tool_recovery_slots = asyncio.Semaphore(0)
+            with patch.object(
+                ChatCompletionRequest,
+                "model_copy",
+                new=_tracked_model_copy,
+            ):
+                recovery_task = asyncio.create_task(
+                    serving._attempt_tool_call_recovery(
+                        processed_request,
+                        request,
+                        object(),
+                        _ToolRecoveryReason.MALFORMED_PROTOCOL,
+                        "original-rid",
+                        ("Bash",),
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(recovery_task.done())
+                self.assertEqual(copy_calls, [])
+
+                serving._tool_recovery_slots.release()
+                return await recovery_task
+
+        result = asyncio.run(_exercise_gate())
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(copy_calls), 1)
+        self.assertEqual(len(fake.recovery_requests), 1)
+
+    def test_v11_recovery_rid_cannot_share_original_abort_prefix(self):
+        request = self._declared_tool_request("Bash")
+        fake = _FakeRecoveryOpenAI([], _tool_response())
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        async def _exercise_prefix_collision():
+            with patch(
+                "sglang.srt.entrypoints.anthropic.serving.uuid.uuid4",
+                side_effect=[
+                    SimpleNamespace(hex="a" * 32),
+                    SimpleNamespace(hex="b" * 32),
+                ],
+            ):
+                return await serving._attempt_tool_call_recovery(
+                    processed_request,
+                    request,
+                    object(),
+                    _ToolRecoveryReason.MALFORMED_PROTOCOL,
+                    "a",
+                    ("Bash",),
+                )
+
+        result = asyncio.run(_exercise_prefix_collision())
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.recovery_rid.startswith("b" * 32))
+        self.assertFalse(result.recovery_rid.startswith("a"))
+        self.assertEqual(fake.recovery_adapted_requests[0].rid, result.recovery_rid)
+
+    def test_v11_recovery_emits_keepalive_ping_while_waiting(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "prefix"})]),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+            recovery_delay=0.03,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_ping_interval_s = 0.005
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertTrue(any(event["type"] == "ping" for event in events))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+
+    def test_v11_recovery_timeout_cancels_retry_and_fails_closed(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk([_choice({"content": "prefix"})]),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(),
+            recovery_delay=0.05,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_timeout_s = 0.01
+        serving._tool_recovery_ping_interval_s = 0.003
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertTrue(fake.recovery_cancelled)
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertTrue(any(event["type"] == "ping" for event in events))
+        self.assertEqual(events[-2]["type"], "error")
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_v11_client_disconnect_during_keepalive_cancels_recovery(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            _tool_response(),
+            recovery_delay=0.1,
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        serving._tool_recovery_ping_interval_s = 0.005
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        async def _consume_one_ping_then_disconnect():
+            stream = serving._generate_anthropic_stream(
+                adapted_request=SimpleNamespace(rid="original-rid"),
+                processed_request=processed_request,
+                anthropic_request=request,
+                raw_request=object(),
+            )
+            first = await stream.__anext__()
+            self.assertEqual(first, ": anthropic-tool-recovery\n\n")
+            await stream.aclose()
+
+        asyncio.run(_consume_one_ping_then_disconnect())
+
+        self.assertTrue(fake.recovery_cancelled)
+        self.assertTrue(fake.stream_closed)
+
+    def test_v11_recovery_rejects_length_truncated_tool_result(self):
+        request = self._declared_tool_request("Bash")
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [f"data: {json.dumps(upstream_error)}\n\n"],
+            _tool_response(finish_reason="length"),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        self.assertEqual(len(fake.recovery_requests), 1)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_v11_recovered_schema_mismatch_follows_original_strictness(self):
+        schema = {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        }
+        response = _tool_response(name="Read", arguments="{}")
+        serving = self._serving()
+
+        non_strict = self._declared_tool_request(
+            {"name": "Read", "strict": False, "input_schema": schema}
+        )
+        recovered = serving._validated_recovery_calls(
+            response,
+            non_strict,
+            "recovery-rid",
+            {"Read"},
+        )
+        self.assertEqual(recovered.calls[0].tool_input, {})
+
+        strict = self._declared_tool_request(
+            {"name": "Read", "strict": True, "input_schema": schema}
+        )
+        with self.assertRaisesRegex(MalformedToolCallError, "declared schema"):
+            serving._validated_recovery_calls(
+                response,
+                strict,
+                "recovery-rid",
+                {"Read"},
+            )
+
+    def test_v11_named_choice_overrides_conflicting_observed_candidate(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            tool_choice={"type": "tool", "name": "Read"},
+        )
+        upstream_error = {
+            "error": {
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "code": 500,
+            }
+        }
+        fake = _FakeRecoveryOpenAI(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_wrong_intent",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": '{"command":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ],
+            _tool_response(name="Read", arguments='{"file_path":"/tmp/a"}'),
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        processed_request = serving._convert_to_chat_completion_request(request)
+
+        events = asyncio.run(
+            _collect_anthropic_events_with_processed_request(
+                serving,
+                request,
+                processed_request,
+            )
+        )
+
+        recovery_request = fake.recovery_requests[0]
+        self.assertEqual(recovery_request.tool_choice.function.name, "Read")
+        self.assertEqual(
+            [tool.function.name for tool in recovery_request.tools],
+            ["Read"],
+        )
+        self.assertFalse(any(event["type"] == "error" for event in events))
+
+    def test_v10_stream_rejects_undeclared_v9_tool_before_tool_start(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        events = self._single_tool_stream_events(
+            request,
+            "mcp__azure-devops__repo_get_pull_request",
+            "{}",
+        )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+        self.assertIn("undeclared tool", events[1]["error"]["message"])
+
+    def test_v10_stream_treats_schema_valid_tool_strings_as_opaque(self):
+        """The Anthropic boundary must not blacklist XML/DSML argument data.
+
+        Raw DSML grammar corruption is rejected by the DeepSeek detector. Once
+        an upstream parser has produced a schema-valid JSON object, arbitrary
+        strings remain valid Messages API tool input.
+        """
+        tool = {
+            "name": "Bash",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+        request = self._declared_tool_request(tool)
+        command = "printf '%s' '</parameter></｜DSML｜lockImports>'"
+        events = self._single_tool_stream_events(
+            request,
+            "Bash",
+            json.dumps({"command": command}, ensure_ascii=False),
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        arguments = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"].get("type") == "input_json_delta"
+        )
+        self.assertEqual(json.loads(arguments), {"command": command})
+
+    def test_v10_stream_publishes_declared_schema_valid_call(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+        events = self._single_tool_stream_events(
+            request,
+            "Bash",
+            '{"command":"printf hello","timeout":30}',
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event for event in events if event["type"] == "content_block_start"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "Bash")
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_v11_parallel_non_strict_schema_mismatch_is_published(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_valid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": '{"file_path":"/tmp/a"}',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_invalid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_starts = [
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(tool_starts), 2)
+
+    def test_v11_parallel_strict_calls_remain_atomic_on_schema_failure(self):
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "strict": True,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        )
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_valid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": '{"file_path":"/tmp/a"}',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_invalid",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["message_start", "error", "message_stop"],
+        )
+
+    def test_stream_tool_text_then_fresh_tool_preserves_order_atomically(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_before_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":"first"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "Checking one more source."})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_after_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "type": "function",
+                                        "function": {"arguments": ':"second"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        starts = [event for event in events if event["type"] == "content_block_start"]
+        self.assertEqual(
+            [(event["index"], event["content_block"]["type"]) for event in starts],
+            [(0, "tool_use"), (1, "text"), (2, "tool_use")],
+        )
+        block_events = [
+            (
+                event["type"],
+                event["index"],
+                event.get("content_block", {}).get("type"),
+                event.get("delta", {}).get("type"),
+            )
+            for event in events
+            if event["type"].startswith("content_block")
+        ]
+        self.assertEqual(
+            block_events,
+            [
+                ("content_block_start", 0, "tool_use", None),
+                ("content_block_delta", 0, None, "input_json_delta"),
+                ("content_block_stop", 0, None, None),
+                ("content_block_start", 1, "text", None),
+                ("content_block_delta", 1, None, "text_delta"),
+                ("content_block_stop", 1, None, None),
+                ("content_block_start", 2, "tool_use", None),
+                ("content_block_delta", 2, None, "input_json_delta"),
+                ("content_block_delta", 2, None, "input_json_delta"),
+                ("content_block_stop", 2, None, None),
+            ],
+        )
+        self.assertEqual(
+            [
+                event["content_block"]["name"]
+                for event in starts
+                if event["content_block"]["type"] == "tool_use"
+            ],
+            ["lookup", "lookup"],
+        )
+        text = "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "text_delta"
+        )
+        self.assertEqual(text, "Checking one more source.")
+        arguments_by_index = {}
+        for event in events:
+            if (
+                event["type"] == "content_block_delta"
+                and event["delta"]["type"] == "input_json_delta"
+            ):
+                arguments_by_index.setdefault(event["index"], []).append(
+                    event["delta"]["partial_json"]
+                )
+        self.assertEqual(
+            {index: "".join(parts) for index, parts in arguments_by_index.items()},
+            {0: '{"query":"first"}', 2: '{"query":"second"}'},
+        )
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_stream_invalid_second_tool_after_text_releases_no_transaction(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_good_before_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":"first"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({"content": "Checking one more source."})]),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_bad_after_text",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query":',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(
+            any(event["type"] == "content_block_start" for event in events)
+        )
+        self.assertNotIn("Checking one more source.", json.dumps(events))
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("malformed tool-call arguments", error["error"]["message"])
+
+    def test_stream_tool_call_is_committed_after_terminal_finish(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_good",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ':"sglang"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        tool_start = next(
+            event
+            for event in events
+            if event["type"] == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        )
+        self.assertEqual(tool_start["content_block"]["name"], "lookup")
+        argument_parts = [
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        ]
+        self.assertEqual("".join(argument_parts), '{"query":"sglang"}')
+        self.assertEqual(
+            next(event for event in events if event["type"] == "message_delta")[
+                "delta"
+            ]["stop_reason"],
+            "tool_use",
+        )
+
+    def test_stream_parallel_tool_argument_deltas_remain_valid(self):
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_parallel_0",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_parallel_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"query"',
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {"arguments": ':"first"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "type": "function",
+                                        "function": {"arguments": ':"second"}'},
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        arguments_by_index = {}
+        for event in events:
+            if (
+                event["type"] == "content_block_delta"
+                and event["delta"]["type"] == "input_json_delta"
+            ):
+                arguments_by_index.setdefault(event["index"], []).append(
+                    event["delta"]["partial_json"]
+                )
+        self.assertEqual(
+            {index: "".join(parts) for index, parts in arguments_by_index.items()},
+            {0: '{"query":"first"}', 1: '{"query":"second"}'},
+        )
+
+    def test_cache_read_exceeds_prompt_tokens_clamps_to_zero(self):
+        """When cached_tokens > prompt_tokens, input_tokens clamps to 0 instead of going negative."""
+        usage = {
+            "prompt_tokens": 4,
+            "completion_tokens": 0,
+            "total_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 10},
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "ok"})], usage=usage),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        message_start = next(e for e in events if e["type"] == "message_start")
+        usage_out = message_start["message"]["usage"]
+        self.assertEqual(usage_out["input_tokens"], 0)
+        self.assertEqual(usage_out["cache_read_input_tokens"], 10)
+
+    def test_usage_without_prompt_tokens_details(self):
+        """Usage object without prompt_tokens_details must omit cache_read_input_tokens cleanly."""
+        usage = {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "ok"})], usage=usage),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        message_start = next(e for e in events if e["type"] == "message_start")
+        usage_out = message_start["message"]["usage"]
+        self.assertEqual(usage_out["input_tokens"], 5)
+        self.assertNotIn("cache_read_input_tokens", usage_out)
+
+    def test_non_streaming_error_with_non_json_body(self):
+        """Non-JSON upstream error body falls back to body[:500] as the message (for 4xx)."""
+        serving = AnthropicServing(
+            _FakeNonStreamingErrorOpenAI(
+                status_code=400,
+                body=b"<html>upstream gateway rejected: bad payload</html>",
+            )
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        anthropic_request = self._anthropic_request(stream=False)
+        response = asyncio.run(
+            serving._handle_non_streaming(chat_request, anthropic_request, object())
+        )
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertIn("upstream gateway rejected", payload["error"]["message"])
+
+    def test_non_streaming_error_5xx_scrubs_message(self):
+        """5xx errors always return a generic message regardless of upstream payload."""
+        for status_code, expected_type in [
+            (500, "api_error"),
+            (502, "api_error"),
+            (503, "overloaded_error"),
+            (504, "api_error"),
+        ]:
+            serving = AnthropicServing(
+                _FakeNonStreamingErrorOpenAI(
+                    status_code=status_code,
+                    body=b'{"error":{"message":"sensitive internals: /opt/secret","type":"internal"}}',
+                )
+            )
+            chat_request = ChatCompletionRequest(
+                model="test-model",
+                max_tokens=16,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            anthropic_request = self._anthropic_request(stream=False)
+            response = asyncio.run(
+                serving._handle_non_streaming(chat_request, anthropic_request, object())
+            )
+            payload = json.loads(response.body)
+            self.assertEqual(
+                response.status_code,
+                status_code,
+                f"status {status_code} should be preserved",
+            )
+            self.assertEqual(
+                payload["error"]["type"],
+                expected_type,
+                f"status {status_code} should map to {expected_type}",
+            )
+            self.assertEqual(
+                payload["error"]["message"],
+                "Internal server error",
+                f"status {status_code} must scrub the message; got {payload['error']['message']!r}",
+            )
+
+    def test_non_streaming_response_includes_thinking_block(self):
+        """When the OpenAI response carries reasoning_content, the Anthropic response has a thinking block first."""
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "the answer is 4",
+                            "reasoning_content": "2 + 2 = 4",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 5,
+                    "total_tokens": 8,
+                },
+            }
+        )
+        anthropic_response = self._serving()._convert_response(response)
+        # thinking block first, then text block
+        self.assertEqual(anthropic_response.content[0].type, "thinking")
+        self.assertEqual(anthropic_response.content[0].thinking, "2 + 2 = 4")
+        self.assertEqual(anthropic_response.content[1].type, "text")
+        self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
+
+    def test_non_streaming_omitted_thinking_is_empty_and_signed(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_content": "private reasoning",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 5,
+                    "total_tokens": 8,
+                },
+            }
+        )
+        serving = self._serving(with_thinking_codec=True)
+        request = self._anthropic_request(
+            stream=False,
+            thinking={"type": "adaptive", "display": "omitted"},
+        )
+        anthropic_response = serving._convert_response(response, request)
+        thinking = anthropic_response.content[0]
+        self.assertEqual(thinking.type, "thinking")
+        self.assertEqual(thinking.thinking, "")
+        self.assertTrue(thinking.signature.startswith("sglang_thinking_v1."))
+        self.assertEqual(
+            serving._thinking_signature_codec.unseal(thinking.signature, "test-model"),
+            "private reasoning",
+        )
+
+    def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
+        """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "disabled"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
+
+    def test_request_thinking_enabled_with_budget_tokens_logs_warning(self):
+        """SDK shape: ``enabled`` requires ``budget_tokens``. We accept it
+        (the SDK would), but log a WARNING because the local backend has
+        no equivalent hard-cap knob — the budget is not enforced."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "enabled", "budget_tokens": 2048}, stream=False
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertTrue(
+            any("budget_tokens=2048" in r and "not enforced" in r for r in log.output),
+            f"expected unenforced-budget warning: {log.output}",
+        )
+
+    def test_request_thinking_enabled_requires_budget_tokens(self):
+        """SDK requires ``budget_tokens`` for ``type=enabled`` — Pydantic 400."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        self.assertIn("budget_tokens", str(ctx.exception))
+
+    def test_request_thinking_enabled_budget_below_min_is_rejected(self):
+        """SDK doc: ``budget_tokens`` must be >= 1024."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "enabled", "budget_tokens": 512}, stream=False
+            )
+        self.assertIn("1024", str(ctx.exception))
+
+    def test_request_thinking_disabled_with_display_is_rejected(self):
+        """SDK ``ThinkingConfigDisabledParam`` has no ``display`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "disabled", "display": "omitted"}, stream=False
+            )
+        self.assertIn("display", str(ctx.exception))
+
+    def test_request_thinking_disabled_with_budget_is_rejected(self):
+        """SDK ``ThinkingConfigDisabledParam`` has no ``budget_tokens`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "disabled", "budget_tokens": 2048}, stream=False
+            )
+        self.assertIn("budget_tokens", str(ctx.exception))
+
+    def test_request_thinking_adaptive_with_budget_is_rejected(self):
+        """SDK ``ThinkingConfigAdaptiveParam`` has no ``budget_tokens`` field."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "adaptive", "budget_tokens": 2048}, stream=False
+            )
+        self.assertIn("budget_tokens", str(ctx.exception))
+
+    def test_request_thinking_adaptive_is_treated_as_enabled(self):
+        """Claude 4.7 ``thinking.type='adaptive'`` (the SDK default for
+        unknown models) must be accepted and routed to ``apply_reasoning_enabled(True)``.
+        """
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "adaptive"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
+    def test_request_thinking_display_omitted_still_enables_reasoning(self):
+        """Omitting display suppresses wire text, not model reasoning."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 1024,
+                "display": "omitted",
+            },
+            stream=False,
+        )
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
+    def test_omitted_thinking_without_server_key_fails_closed(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "omitted"},
+            stream=False,
+        )
+        response = asyncio.run(serving.handle_messages(request, object()))
+        self.assertEqual(response.status_code, 500)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["error"]["type"], "api_error")
+
+    def test_thinking_signature_codec_rejects_tamper_and_wrong_model(self):
+        codec = _ThinkingSignatureCodec(b"k" * 32)
+        signature = codec.seal("private reasoning", "model-a")
+        self.assertEqual(codec.unseal(signature, "model-a"), "private reasoning")
+        replacement = "A" if signature[-1] != "A" else "B"
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature[:-1] + replacement, "model-a")
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature, "model-b")
+
+    def test_sealed_thinking_history_restores_native_reasoning(self):
+        serving = self._serving(with_thinking_codec=True)
+        serving.openai_serving_chat.native_reasoning_history = True
+        signature = serving._thinking_signature_codec.seal(
+            "restored private reasoning", "test-model"
+        )
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": signature,
+                        },
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant = next(
+            message for message in chat_request.messages if message.role == "assistant"
+        )
+        self.assertEqual(assistant.reasoning_content, "restored private reasoning")
+
+    def test_request_output_config_effort_maps_to_reasoning_effort(self):
+        """``output_config.effort`` rows map onto ``reasoning_effort``."""
+        for anthropic_effort, openai_effort in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "max"),  # OpenAI Literal has no xhigh
+            ("max", "max"),
+        ]:
+            with self.subTest(anthropic_effort=anthropic_effort):
+                serving = self._serving()
+                request = self._anthropic_request(
+                    output_config={"effort": anthropic_effort}, stream=False
+                )
+                chat_request = serving._convert_to_chat_completion_request(request)
+                self.assertEqual(chat_request.reasoning_effort, openai_effort)
+
+    def test_request_output_config_task_budget_is_logged_not_enforced(self):
+        """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            output_config={"task_budget": {"type": "tokens", "total": 32768}},
+            stream=False,
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        # max_tokens is untouched
+        self.assertEqual(chat_request.max_tokens, 16)
+        self.assertTrue(any("task_budget" in r and "32768" in r for r in log.output))
+
+    def test_request_betas_is_accepted_and_logged(self):
+        """``betas`` is accepted and logged; the local backend has no beta system."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(betas=["thinking-2025-08-04"], stream=False)
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+        ) as log:
+            serving._convert_to_chat_completion_request(request)
+        self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
+
+    def test_assistant_thinking_history_is_rewrapped_for_chat_template(self):
+        """Past-turn thinking blocks get re-emitted via wrap_reasoning_history."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        # ``ChatCompletionRequest.messages`` is a list of Pydantic
+        # ChatCompletionMessage*Param instances; access via attributes.
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        content = assistant_msg.content
+        # Reasoning history sits in front; the thinking block itself is dropped
+        # from the prompt so its text is not duplicated.
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict):
+                    texts.append(part.get("text", ""))
+                else:
+                    texts.append(getattr(part, "text", "") or "")
+        else:
+            texts = [content]
+        joined = "\n".join(texts)
+        self.assertIn("<think>", joined)
+        self.assertIn("ponder", joined)
+        self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+
+    def test_assistant_thinking_history_uses_native_reasoning_content(self):
+        """Channel-framing encoders take thinking history as ``reasoning_content``.
+
+        Splicing the detector's markers into content would nest a reasoning block
+        inside the content channel and leave the real one empty, training the
+        model to emit raw markers as visible text.
+        """
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+            def wrap_reasoning_history(self, text):
+                raise AssertionError("must not rewrap for a native-history encoder")
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+
+    def test_thinking_only_turn_keeps_native_reasoning_content(self):
+        """An assistant turn that is only thinking still carries its reasoning."""
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "ponder"}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "")
+
+    def test_redacted_thinking_history_is_rejected(self):
+        """``redacted_thinking`` cannot be rendered by local parsers."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque"},
+                    ],
+                },
+            ],
+        )
+        with self.assertRaises(ValueError):
+            serving._convert_to_chat_completion_request(request)
+
+    def test_stream_text_then_thinking_closes_text_block(self):
+        """Text deltas followed by reasoning_content must close the text block before opening thinking."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": "Direct"})]),
+                _chunk([_choice({"reasoning_content": "but wait, let me think"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        block_events = [
+            (event["type"], event.get("content_block", {}).get("type"))
+            for event in events
+            if event["type"].startswith("content_block")
+        ]
+        # text (start, delta, stop) then thinking (start, delta, stop)
+        self.assertEqual(block_events[0], ("content_block_start", "text"))
+        text_stop_idx = next(
+            i for i, ev in enumerate(block_events) if ev == ("content_block_stop", None)
+        )
+        thinking_start_idx = next(
+            i
+            for i, ev in enumerate(block_events)
+            if ev == ("content_block_start", "thinking")
+        )
+        self.assertLess(text_stop_idx, thinking_start_idx)
+
+    def test_stream_consecutive_tool_calls_get_separate_blocks(self):
+        """Two tool_use calls in sequence must occupy distinct content_block indices."""
+        serving = self._serving(
+            [
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_a",
+                                        "function": {
+                                            "name": "alpha",
+                                            "arguments": '{"x":1}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk(
+                    [
+                        _choice(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_b",
+                                        "function": {
+                                            "name": "beta",
+                                            "arguments": '{"y":2}',
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                ),
+                _chunk([_choice({}, finish_reason="tool_calls")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        starts = [
+            (e["index"], e["content_block"]["name"])
+            for e in events
+            if e["type"] == "content_block_start"
+        ]
+        stops = [e["index"] for e in events if e["type"] == "content_block_stop"]
+        deltas = [
+            (e["index"], e["delta"].get("partial_json"))
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e["delta"].get("type") == "input_json_delta"
+        ]
+        # Each tool gets its own start, its own stop, and its own
+        # argument delta — without the fix, beta's args were appended
+        # to alpha's index 0 block.
+        self.assertEqual(starts, [(0, "alpha"), (1, "beta")])
+        self.assertEqual(stops, [0, 1])
+        self.assertEqual(deltas, [(0, '{"x":1}'), (1, '{"y":2}')])
+
+    def test_stream_finish_chunk_with_payload_emits_delta(self):
+        """A chunk carrying both finish_reason and content must not drop the content."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant"})]),
+                _chunk([_choice({"content": "last token"}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        text_deltas = [
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e["delta"].get("type") == "text_delta"
+        ]
+        self.assertEqual(text_deltas, ["last token"])
+        # And stop_reason still travels via message_delta
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+        self.assertEqual(message_delta["delta"]["stop_reason"], "end_turn")
+
+    def test_stream_empty_completion_with_finish_reason_emits_message_delta(self):
+        """An empty stream with a finish_reason is a legitimate stop, not api_error."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant"})]),
+                _chunk([_choice({}, finish_reason="length")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        types = [e["type"] for e in events]
+        self.assertIn("message_start", types)
+        self.assertIn("message_delta", types)
+        self.assertIn("message_stop", types)
+        self.assertNotIn("error", types)
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+        self.assertEqual(message_delta["delta"]["stop_reason"], "max_tokens")
+
+    def test_stream_no_finish_no_content_still_emits_api_error(self):
+        """Backend that drops both content and finish_reason is genuinely broken."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant"})]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        types = [e["type"] for e in events]
+        self.assertIn("error", types)
+        err = next(e for e in events if e["type"] == "error")
+        self.assertEqual(err["error"]["type"], "api_error")
+
+    def test_stream_upstream_error_envelope_is_forwarded(self):
+        """OpenAI handler streaming-error JSON must surface real type/message."""
+        upstream_error = {
+            "error": {
+                "object": "error",
+                "message": "context length exceeded",
+                "type": "BadRequestError",
+                "code": 400,
+            }
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant"})]),
+                f"data: {json.dumps(upstream_error)}\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        err = next(e for e in events if e["type"] == "error")
+        self.assertEqual(err["error"]["type"], "invalid_request_error")
+        self.assertEqual(err["error"]["message"], "context length exceeded")
+        # message_stop must still close the stream
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_stream_parse_failure_closes_open_content_block(self):
+        """Unparsable mid-stream chunk must still close any open content_block."""
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": "first"})]),
+                "data: {not-json\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        types = [e["type"] for e in events]
+        # Sequence: message_start, content_block_start, content_block_delta,
+        # content_block_stop, error, message_stop
+        self.assertIn("content_block_start", types)
+        self.assertEqual(
+            types.count("content_block_stop"),
+            types.count("content_block_start"),
+            f"unbalanced block events: {types}",
+        )
+        self.assertIn("error", types)
+        self.assertEqual(types[-1], "message_stop")
+
+    def test_stream_pre_first_chunk_value_error_emits_envelope(self):
+        """ValueError before any chunk must yield a clean Anthropic error sequence."""
+
+        class _RaisingOpenAI(_FakeOpenAIServingChat):
+            def _generate_chat_stream(
+                self, adapted_request, processed_request, raw_request
+            ):
+                async def _gen():
+                    raise ValueError("tokenization failed")
+                    yield  # pragma: no cover
+
+                return _gen()
+
+        serving = AnthropicServing(_RaisingOpenAI())
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "message_start")
+        self.assertIn("error", types)
+        err = next(e for e in events if e["type"] == "error")
+        self.assertEqual(err["error"]["type"], "invalid_request_error")
+        self.assertIn("tokenization failed", err["error"]["message"])
+        self.assertEqual(types[-1], "message_stop")
+
+    def test_server_tool_only_with_tool_choice_any_raises_400(self):
+        """A request with only server-side tools cannot honor tool_choice=any."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            tool_choice={"type": "any"},
+        )
+        with self.assertRaises(ValueError) as ctx:
+            serving._convert_to_chat_completion_request(request)
+        self.assertIn("tool_choice", str(ctx.exception))
+
+    def test_tool_choice_named_custom_tool_is_resolved(self):
+        """tool_choice={type:'tool', name:'X'} where X is a custom tool wires through."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                    },
+                }
+            ],
+            tool_choice={"type": "tool", "name": "lookup"},
+        )
+        # Must not AttributeError: Tool.function is a Pydantic model, not a
+        # dict — access must be via .name, never .get("name").
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(chat_request.tool_choice.type, "function")
+        self.assertEqual(chat_request.tool_choice.function.name, "lookup")
+
+    def test_tool_choice_named_unknown_tool_raises_400(self):
+        """tool_choice={type:'tool', name:'X'} where X is missing must raise."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "lookup",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_choice={"type": "tool", "name": "nonexistent"},
+        )
+        with self.assertRaises(ValueError) as ctx:
+            serving._convert_to_chat_completion_request(request)
+        self.assertIn("nonexistent", str(ctx.exception))
+
+    def test_convert_response_non_streaming_empty_content_keeps_block(self):
+        """Empty-string completion must still produce a content list of len 1."""
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 0,
+                    "total_tokens": 5,
+                },
+            }
+        )
+        serving = self._serving()
+        anthropic_response = serving._convert_response(response)
+        self.assertEqual(len(anthropic_response.content), 1)
+        self.assertEqual(anthropic_response.content[0].type, "text")
+        self.assertEqual(anthropic_response.content[0].text, "")
+
+    def test_v10_non_streaming_invalid_tool_json_is_not_rewritten_to_empty_input(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-v10-invalid-json",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Read",
+                                        "arguments": '{"file_path":',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "total_tokens": 10,
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(
+            MalformedToolCallError, "malformed tool-call arguments"
+        ):
+            self._serving()._convert_response(response)
+
+    def test_v11_non_streaming_non_strict_schema_failure_is_published(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-v10-schema",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Read",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "total_tokens": 10,
+                },
+            }
+        )
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(response))
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "read"}],
+        )
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(payload["content"][0]["input"], {})
+
+    def test_v11_non_streaming_explicit_strict_schema_failure_is_error(self):
+        response = _tool_response(name="Read", arguments="{}")
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(response))
+        request = self._declared_tool_request(
+            {
+                "name": "Read",
+                "strict": True,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "read"}],
+        )
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
+        self.assertEqual(result.status_code, 500)
+        self.assertEqual(payload["error"]["type"], "api_error")
+        self.assertIn("declared schema", payload["error"]["message"])
+
+    def test_v11_non_streaming_malformed_protocol_recovers_full_response(self):
+        initial_error = JSONResponse(
+            status_code=500,
+            content={
+                "object": "error",
+                "message": "Model emitted malformed DeepSeek tool-call protocol",
+                "type": "InternalServerError",
+                "code": 500,
+            },
+        )
+        fake = _FakeSequentialNonStreamingOpenAI(
+            [initial_error, _tool_response(finish_reason="stop")]
+        )
+        serving = AnthropicServing(fake)
+        serving._tool_recovery_enabled = True
+        request = self._declared_tool_request(
+            {
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            stream=False,
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+
+        result = asyncio.run(
+            serving._handle_non_streaming(chat_request, request, object())
+        )
+        payload = json.loads(result.body)
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(fake.requests), 2)
+        self.assertTrue(fake.requests[1].tools[0].function.strict)
+        self.assertEqual(payload["stop_reason"], "tool_use")
+        self.assertEqual(
+            [block["type"] for block in payload["content"]],
+            ["thinking", "text", "tool_use"],
+        )
+
+    def test_error_response_does_not_leak_exception_name(self):
+        """``error.type`` must stay in Anthropic's documented literal set."""
+        serving = self._serving()
+        response = serving._error_response(
+            status_code=500,
+            error_type="api_error",
+            message="Internal server error",
+            exception_name="KeyError",
+        )
+        body = json.loads(bytes(response.body).decode())
+        self.assertEqual(body["error"]["type"], "api_error")
+
+    def test_user_message_text_tool_text_preserves_order(self):
+        """User message [text, tool_result, text] must stay user→tool→user on the wire."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_x",
+                            "content": "ok",
+                        },
+                        {"type": "text", "text": "second"},
+                    ],
+                }
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        # chat_request.messages items are Pydantic ChatCompletionMessage*Param
+        # variants — use attribute access, not subscripts.
+        roles = [m.role for m in chat_request.messages]
+        self.assertEqual(roles, ["user", "tool", "user"])
+        self.assertEqual(chat_request.messages[0].content, "first")
+        self.assertEqual(chat_request.messages[2].content, "second")
+
+    def test_empty_text_assistant_turn_preserves_role_alternation(self):
+        """Assistant turn with only empty text must NOT vanish from the wire."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+                {"role": "user", "content": "u2"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        roles = [m.role for m in chat_request.messages]
+        # Without the fix this collapses to ['user', 'user'] and breaks
+        # strict role-alternation chat templates (qwen, llama, mistral).
+        self.assertEqual(roles, ["user", "assistant", "user"])
+
+    def test_in_messages_system_merged_when_template_requires_first(self):
+        """When the chat template rejects mid-conversation ``role: "system"``
+        (e.g. Qwen's system-first guard), the converter folds the inline
+        system turn into the leading system block so the template doesn't
+        400. The request object itself is no longer mutated — detection runs
+        in the serving layer on conversion."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        self.assertIsNone(request.system)
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
+
+    def test_in_messages_system_merged_with_top_level_when_merge(self):
+        """On the merge path, a top-level ``system`` field and a mid-conversation
+        system turn are joined into the leading system block; top-level text
+        comes first."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system="You are terse.",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "One word only."},
+                {"role": "assistant", "content": "Okay."},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        self.assertEqual(request.system, "You are terse.")
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(
+            chat_request.messages[0].content, "You are terse.\nOne word only."
+        )
+
+    def test_in_messages_system_passed_through_when_template_allows_inline(self):
+        """When the chat template renders ``role: "system"`` at any position
+        (GLM / Kimi / Qwen3), the inline system turn stays at its original
+        position — preserving the prefix cache and the request's structure."""
+        serving = self._serving(chat_template=self.INLINE_SYSTEM_TEMPLATE)
+        self.assertFalse(serving._merge_inline_system)
+        request = self._anthropic_request(
+            stream=False,
+            system="You are terse.",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "system", "assistant", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "You are terse.")
+        self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
+
+    def test_top_level_system_only_is_unchanged(self):
+        """A request with only the top-level ``system`` field (no in-messages
+        system turn) is unaffected on both detection paths: the system field is
+        preserved verbatim and the dialogue order is untouched. Guards the
+        common multi-turn path against regressions."""
+        for template in (None, self.INLINE_SYSTEM_TEMPLATE):
+            serving = self._serving(chat_template=template)
+            request = self._anthropic_request(
+                stream=False,
+                system="You are a helpful assistant.",
+                messages=[
+                    {"role": "user", "content": "My name is Alice."},
+                    {"role": "assistant", "content": "Hello Alice!"},
+                    {"role": "user", "content": "What is my name?"},
+                ],
+            )
+            self.assertEqual(request.system, "You are a helpful assistant.")
+            self.assertEqual(
+                [m.role for m in request.messages], ["user", "assistant", "user"]
+            )
+            chat_request = serving._convert_to_chat_completion_request(request)
+            self.assertEqual(
+                [m.role for m in chat_request.messages],
+                ["system", "user", "assistant", "user"],
+            )
+            self.assertEqual(
+                chat_request.messages[0].content, "You are a helpful assistant."
+            )
+
+    def test_constructed_message_objects_merged_on_merge_path(self):
+        """Requests built programmatically with ``AnthropicMessage`` objects
+        (e.g. ``handle_count_tokens``) also get inline system folded into the
+        leading block on the merge path."""
+        serving = self._serving()
+        request = AnthropicMessagesRequest(
+            model="m",
+            max_tokens=8,
+            messages=[
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="system", content="be terse"),
+                AnthropicMessage(role="assistant", content="Okay."),
+                AnthropicMessage(role="user", content="go"),
+            ],
+        )
+        self.assertEqual(
+            [m.role for m in request.messages],
+            ["user", "system", "assistant", "user"],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "be terse")
+
+    def test_inline_system_rejects_invalid_user_system_user_placement(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "followed by an assistant"):
+            serving._convert_to_chat_completion_request(request)
+
+    def test_dsv4_inline_system_uses_native_latest_reminder(self):
+        serving = self._serving(chat_encoding_spec="dsv4")
+        request = self._anthropic_request(
+            stream=False,
+            system="Global instruction.",
+            messages=[
+                {"role": "user", "content": "Question"},
+                {"role": "system", "content": "Current reminder."},
+            ],
+        )
+
+        chat_request = serving._convert_to_chat_completion_request(request)
+
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "latest_reminder", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "Global instruction.")
+        self.assertEqual(chat_request.messages[1].content, "Current reminder.")
+        self.assertEqual(chat_request.messages[2].content, "Question")
+
+    def test_thinking_history_drop_on_missing_detector(self):
+        """Replaying a thinking block on a non-reasoning model should not 400."""
+
+        class _NoDetectorOpenAI(_FakeOpenAIServingChat):
+            def wrap_reasoning_history(self, text):
+                raise ValueError("no reasoning detector is configured")
+
+        serving = AnthropicServing(_NoDetectorOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "I think..."}],
+                },
+                {"role": "user", "content": "follow-up"},
+            ],
+        )
+        # Must convert successfully; the thinking block is silently dropped.
+        chat_request = serving._convert_to_chat_completion_request(request)
+        roles = [m.role for m in chat_request.messages]
+        self.assertIn("user", roles)
+        # The assistant turn was rendered (as empty placeholder) so
+        # alternation is preserved.
+        self.assertIn("assistant", roles)
+
+    def test_stop_reason_content_filter_falls_back_with_warning(self):
+        """Unmapped OpenAI finish_reasons default to 'end_turn' + log a warning.
+
+        ``content_filter`` and ``abort`` have no entry in STOP_REASON_MAP
+        because Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
+        stop_sequence/tool_use) has no perfect target. The fallback must
+        produce a spec-valid stop_reason and a WARNING so operators don't
+        silently lose the safety/abort signal.
+        """
+        import logging
+
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "content_filter",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+        serving = self._serving()
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            anthropic_response = serving._convert_response(response)
+        self.assertEqual(anthropic_response.stop_reason, "end_turn")
+        self.assertTrue(
+            any("content_filter" in rec for rec in log.output),
+            f"expected a warning mentioning the unmapped finish_reason: {log.output}",
+        )
+
+
+class TestDetectInlineSystemSupport(unittest.TestCase):
+    """Chat-template detection for mid-conversation system messages (#28883)."""
+
+    def test_guarded_template_not_supported(self):
+        guarded = (
+            "{%- for message in messages %}"
+            "{%- if message.role == 'system' and not loop.first %}"
+            "{{- raise_exception('system must be first') }}"
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+        self.assertFalse(detect_inline_system_support(guarded))
+
+    def test_inline_template_supported(self):
+        inline = (
+            "{%- for message in messages %}"
+            "{{- message.role }}: {{ message.content }}\n"
+            "{%- endfor %}"
+        )
+        self.assertTrue(detect_inline_system_support(inline))
+
+    def test_silent_drop_template_not_supported(self):
+        # Renders only the leading system; silently ignores later system turns.
+        silent_drop = (
+            "{%- if messages[0].role == 'system' %}"
+            "{{ messages[0].content }}\n"
+            "{%- endif %}"
+            "{%- for message in messages %}"
+            "{%- if message.role in ('user', 'assistant') %}"
+            "{{ message.role }}: {{ message.content }}\n"
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+        self.assertFalse(detect_inline_system_support(silent_drop))
+
+    def test_no_template_not_supported(self):
+        self.assertFalse(detect_inline_system_support(None))
+        self.assertFalse(detect_inline_system_support(""))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -61,6 +61,9 @@ tool_calls_template = (
 )
 
 tool_output_template: str = "<tool_result>{content}</tool_result>"
+tool_error_content_template: str = (
+    "Tool execution failed. Treat the following as an error result:\n{content}"
+)
 
 REASONING_EFFORT_TEMPLATE = (
     "Reasoning Effort: {budget} "
@@ -317,6 +320,10 @@ def render_message(
                             else:
                                 text_parts.append(f"[Unsupported {b.get('type')}]")
                         tool_content = "\n\n".join(text_parts)
+                    if block.get("is_error"):
+                        tool_content = tool_error_content_template.format(
+                            content=tool_content
+                        )
                     parts.append(tool_output_template.format(content=tool_content))
                 else:
                     parts.append(f"[Unsupported {block_type}]")
@@ -447,6 +454,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
                 "content": msg.get("content", ""),
+                "is_error": msg.get("is_error") is True,
             }
             # Merge into previous message if it's already a user (merged tool)
             if (

@@ -85,7 +85,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import MalformedToolCallError, ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
@@ -286,16 +286,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     e,
                 )
 
-        # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
+        # Explicit request values still win in ``to_sampling_params``. For
+        # omitted values, operator-provided preferred parameters must outrank
+        # generation_config.json; otherwise an API adapter materializes the
+        # model defaults first and TokenizerManager can no longer tell that the
+        # caller omitted them.
+        model_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
+        preferred_sampling_params = getattr(
+            self.tokenizer_manager, "preferred_sampling_params", None
+        )
+        self.default_sampling_params = dict(model_sampling_params or {})
+        if isinstance(preferred_sampling_params, dict):
+            self.default_sampling_params.update(preferred_sampling_params)
         if (
             self.default_sampling_params
             and not OpenAIServingChat._default_sampling_params_logged
         ):
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                "Using effective default chat sampling params: "
+                f"{self.default_sampling_params}",
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
@@ -890,15 +901,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 if chunk:
                     yield chunk
 
-            # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
-                parser = parser_dict[index]
-                remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
-                )
-                if remaining_chunk:
-                    yield remaining_chunk
-
         else:
             # Regular content
             if delta:
@@ -1424,12 +1426,16 @@ class OpenAIServingChat(OpenAIServingBase):
             # token for it, so it only gets one when tools need the host.
             if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tool_choice == "none":
+                # Disabled tools must not survive in custom-encoder metadata.
+                for message in messages:
+                    message.pop("tools", None)
+            elif request.tools:
                 messages[0]["tools"] = [
                     (
                         chat_encoding.dsv41_tool_payload(tool)
                         if is_dsv41
-                        else tool.model_dump()
+                        else tool.model_dump(exclude_unset=True, by_alias=True)
                     )
                     for tool in request.tools
                 ]
@@ -1696,6 +1702,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except MalformedToolCallError as e:
+            return self.create_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -1742,15 +1752,16 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
 
         stream_started = False
+        generation_stream = self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        )
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in generation_stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -1968,11 +1979,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        except MalformedToolCallError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
+            yield f"data: {error}\n\n"
         except ValueError as e:
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Parsing and adapter failures can terminate this loop while the
+            # scheduler is still decoding.  Explicitly close the tokenizer
+            # stream so its ownership cleanup dispatches AbortReq immediately;
+            # relying on async-generator finalization left long generations
+            # orphaned and produced repeated "state was deleted" warnings.
+            await generation_stream.aclose()
 
         yield "data: [DONE]\n\n"
 
@@ -2099,13 +2124,23 @@ class OpenAIServingChat(OpenAIServingBase):
             effective_tools = self._effective_tools(request)
             if self._tool_call_parsing_active(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    effective_tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+                try:
+                    tool_calls, text, finish_reason = self._process_tool_calls(
+                        text,
+                        effective_tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
+                except MalformedToolCallError:
+                    logger.warning(
+                        "Rejecting completion with malformed DeepSeek tool-call protocol"
+                    )
+                    return self.create_error_response(
+                        "Model emitted malformed DeepSeek tool-call protocol",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -2312,6 +2347,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except MalformedToolCallError:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
@@ -2729,45 +2766,71 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
         else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
-            if flush:
-                end_text, end_calls = parser.parse_stream_end()
-                normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+            result = parser.parse_stream_chunk_result(delta)
 
-        # Yield normal text
+        normal_text, calls = result.normal_text, result.calls
+        ordered_items = result.ordered_items
+        if flush and not isinstance(parser, JsonArrayParser):
+            end_result = parser.parse_stream_end_result()
+            end_text, end_calls = end_result.normal_text, end_result.calls
+            end_ordered_items = end_result.ordered_items
+
+            if ordered_items is not None:
+                ordered_items = list(ordered_items)
+                if end_ordered_items is not None:
+                    ordered_items.extend(end_ordered_items)
+                else:
+                    # ``finish`` is terminal and its normal text follows
+                    # everything returned by the incremental parse.
+                    ordered_items.extend(end_calls)
+                    if end_text:
+                        ordered_items.append(end_text)
+            elif end_ordered_items is not None:
+                # Preserve an ordinary incremental prefix before a detector
+                # that only supplies ordering metadata from ``finish``.
+                ordered_items = []
+                if normal_text:
+                    ordered_items.append(normal_text)
+                ordered_items.extend(calls)
+                ordered_items.extend(end_ordered_items)
+            normal_text = (normal_text or "") + end_text
+            calls = list(calls) + end_calls
+
+        calls = list(calls)
+        remaining_chunk = None
+        if flush:
+            remaining_chunk = self._check_for_unstreamed_tool_args(
+                parser, content, request, index
+            )
+
+        # A detector can finish an active invoke and expose its postamble in
+        # the same parse increment.  Continuation-only call items belong to
+        # the already-open tool call and therefore must precede that text.
+        # A named call starts a new tool, so text before it remains a preamble
+        # (or inter-call text) and is emitted first.  This distinction is
+        # required by Anthropic streams, where opening a text block closes the
+        # current tool_use block permanently.
+        leading_continuations = 0
         if normal_text:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(content=normal_text),
-                finish_reason=None,
+            while (
+                leading_continuations < len(calls)
+                and calls[leading_continuations].name is None
+            ):
+                leading_continuations += 1
+
+        remaining_before_text = bool(
+            remaining_chunk
+            and normal_text
+            and (
+                leading_continuations
+                or (not calls and has_tool_calls.get(index, False))
             )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[choice_data],
-                model=request.model,
-            )
+        )
 
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                )
-
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-        # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-        for call_item in calls:
+
+        def build_tool_call_chunk(call_item: ToolCallItem) -> str:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
@@ -2804,7 +2867,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
                 prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
@@ -2816,7 +2878,78 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        def build_text_chunk(text: str) -> str:
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=index,
+                delta=DeltaMessage(content=text),
+                finish_reason=None,
+            )
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[choice_data],
+                model=request.model,
+            )
+
+            if continuous_usage_stats:
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                )
+
+            return f"data: {chunk.model_dump_json()}\n\n"
+
+        if ordered_items is not None:
+            # ``remaining_chunk`` is the terminal argument suffix for the last
+            # active tool. Keep it after that tool's parsed deltas and before
+            # any following text block.
+            remaining_after = None
+            for item_index, item in enumerate(ordered_items):
+                if isinstance(item, ToolCallItem):
+                    remaining_after = item_index
+
+            if remaining_chunk and remaining_after is None:
+                # No call item in this increment means the suffix belongs to a
+                # tool opened by an earlier increment.
+                remaining_after = -1
+
+            if remaining_chunk and remaining_after == -1:
+                yield remaining_chunk
+
+            for item_index, item in enumerate(ordered_items):
+                if isinstance(item, str):
+                    if item:
+                        yield build_text_chunk(item)
+                else:
+                    yield build_tool_call_chunk(item)
+                if remaining_chunk and item_index == remaining_after:
+                    yield remaining_chunk
+
+            return
+
+        for call_item in calls[:leading_continuations]:
+            yield build_tool_call_chunk(call_item)
+
+        if remaining_before_text:
+            yield remaining_chunk
+
+        # Yield normal text after continuations for the active tool, but before
+        # any named call that starts a new tool.
+        if normal_text:
+            yield build_text_chunk(normal_text)
+
+        for call_item in calls[leading_continuations:]:
+            yield build_tool_call_chunk(call_item)
+
+        if remaining_chunk and not remaining_before_text:
+            yield remaining_chunk
 
     def _check_for_unstreamed_tool_args(
         self,

@@ -14,6 +14,7 @@ from pydantic import (
     Discriminator,
     Field,
     NonNegativeInt,
+    StrictBool,
     Tag,
     field_validator,
     model_validator,
@@ -138,6 +139,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: StrictBool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
@@ -270,8 +272,9 @@ class AnthropicThinkingParam(BaseModel):
     equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
     compatibility but the backend has no hard-cap knob to honor it; the
     serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` is accepted but
-    similarly cannot suppress reasoning mid-stream and is logged.
+    budget is not enforced. ``display="omitted"`` suppresses reasoning
+    text and returns an authenticated opaque signature that restores the
+    hidden reasoning when it is passed back on a later turn.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
