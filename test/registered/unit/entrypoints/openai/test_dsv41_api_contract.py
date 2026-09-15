@@ -23,7 +23,6 @@ from sglang.srt.entrypoints.openai.chat_encoding import InlineSystemStrategy
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
-
 SCHEMA = {
     "type": "object",
     "properties": {"command": {"type": "string"}},
@@ -66,6 +65,109 @@ def chunks(text, size, *, length=False):
 
 
 class V41ResponsesContract(unittest.TestCase):
+    def test_real_request_conversion_preserves_native_ids_on_vision_model(self):
+        # Regression from the first live V4.1 Responses request. The previous
+        # stream fixtures began after conversion and missed prompt="" with
+        # populated native IDs on an is_multimodal=True model. Exercise the
+        # real encoder, create_responses and API generator; stub only tokenize
+        # and GPU generation. Cover text/image, plain/tool, full/stream paths.
+        for with_image in (False, True):
+            for with_tool in (False, True):
+                for stream in (False, True):
+                    with self.subTest(image=with_image, tool=with_tool, stream=stream):
+                        handler = serving()
+                        handler.default_chat_template_kwargs = {}
+                        handler.tokenizer_manager.model_config.is_multimodal = True
+                        handler.template_manager.chat_template_name = None
+                        handler.tokenizer_manager.model_config.hf_config.image_token_id = (
+                            128100
+                        )
+                        tokenizer = handler.tokenizer_manager.tokenizer
+                        tokenizer.convert_ids_to_tokens.return_value = "<image>"
+                        native_ids = [128000, 100, 200, 128001]
+                        tokenizer.encode.return_value = native_ids
+                        captured = []
+
+                        async def generate(adapted, *_args, **_kwargs):
+                            captured.append(adapted)
+                            self.assertIsNone(adapted.text)
+                            self.assertEqual(adapted.input_ids, native_ids)
+                            self.assertEqual(
+                                adapted.image_data,
+                                (
+                                    ["http://example.com/fixture.png"]
+                                    if with_image
+                                    else None
+                                ),
+                            )
+                            if with_tool:
+                                self.assertIn("structural_tag", adapted.sampling_params)
+                            yield engine_chunk(
+                                protocol() if with_tool else "42", finish=True
+                            )
+
+                        handler.tokenizer_manager.generate_request = Mock(
+                            side_effect=generate
+                        )
+                        content = [
+                            {
+                                "type": "input_text",
+                                "text": "Run pwd." if with_tool else "Reply 42.",
+                            }
+                        ]
+                        if with_image:
+                            content.append(
+                                {
+                                    "type": "input_image",
+                                    "image_url": "http://example.com/fixture.png",
+                                }
+                            )
+                        request = ResponsesRequest(
+                            model="deepseek-v4.1-flash",
+                            input=[{"role": "user", "content": content}],
+                            stream=stream,
+                            store=False,
+                            max_output_tokens=1024,
+                            chat_template_kwargs={"thinking": False},
+                            tools=(
+                                [
+                                    {
+                                        "type": "function",
+                                        "name": "Bash",
+                                        "parameters": SCHEMA,
+                                        "strict": True,
+                                    }
+                                ]
+                                if with_tool
+                                else []
+                            ),
+                            tool_choice="required" if with_tool else "none",
+                        )
+
+                        async def run():
+                            response = await handler.create_responses(request)
+                            self.assertFalse(
+                                hasattr(response, "status_code"),
+                                getattr(response, "body", None),
+                            )
+                            if stream:
+                                payloads = event_payloads(
+                                    await collect_stream_events(response)
+                                )
+                                self.assertEqual(
+                                    payloads[-1]["type"], "response.completed"
+                                )
+                                return payloads[-1]["response"]
+                            return response.model_dump()
+
+                        response = asyncio.run(run())
+                        self.assertEqual(response["status"], "completed")
+                        self.assertEqual(len(captured), 1)
+                        self.assertEqual(
+                            response["output"][0]["type"],
+                            "function_call" if with_tool else "message",
+                        )
+
     def run_stream(self, text, size=7, *, strict=False, length=False):
         handler = serving()
         request = ResponsesRequest(

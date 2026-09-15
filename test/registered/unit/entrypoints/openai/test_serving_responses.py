@@ -504,6 +504,39 @@ class FullResponseUsageTestCase(CustomTestCase):
 
 
 class MultimodalRequestTestCase(CustomTestCase):
+    def test_shared_prompt_selection_matches_each_encoder_contract(self):
+        serving = make_serving(is_multimodal=True)
+        processed = MessageProcessingResult(
+            prompt="standard vision text",
+            prompt_ids=[10, 20],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        for spec, expected in (
+            (None, processed.prompt),
+            ("dsv41", [10, 20]),
+            ("kimi_k3", [10, 20]),
+            ("inkling", [10, 20]),
+        ):
+            serving.chat_encoding_spec = spec
+            self.assertEqual(serving._select_engine_prompt(processed, True), expected)
+            self.assertEqual(serving._select_engine_prompt(processed, False), [10, 20])
+            self.assertEqual(
+                serving._select_engine_prompt(processed, True, input_ids_provided=True),
+                [10, 20],
+            )
+        processed.prompt_ids = []
+        self.assertEqual(
+            serving._select_engine_prompt(processed, True), processed.prompt
+        )
+        processed.prompt_ids = "text-only pre-rendered input"
+        self.assertEqual(
+            serving._select_engine_prompt(processed, False), processed.prompt_ids
+        )
+
     def test_text_only_create_responses_rejects_media_before_generation(self):
         serving = make_serving()
         serving._process_messages = Mock()

@@ -1036,17 +1036,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     raw_request=raw_request,
                 )
             try:
-                result: Union[
-                    ORJSONResponse, ResponsesResponse
-                ] = await self.responses_full_generator(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    context,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    require_reasoning=require_reasoning,
+                result: Union[ORJSONResponse, ResponsesResponse] = (
+                    await self.responses_full_generator(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        context,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        require_reasoning=require_reasoning,
+                    )
                 )
                 return result
             except Exception as e:
@@ -1099,12 +1099,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
-        if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
-        else:
-            request_prompts = [processed_messages.prompt_ids]
-            engine_prompts = [processed_messages.prompt_ids]
+        engine_prompt = self._select_engine_prompt(processed_messages, is_multimodal)
+        request_prompts = [engine_prompt]
+        engine_prompts = [engine_prompt]
 
         return (
             messages,

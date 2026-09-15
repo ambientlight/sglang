@@ -1114,30 +1114,16 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_params, processed_messages.reasoning_end_token_ids
         )
 
-        # Handle single vs multiple requests
-        if request.input_ids is not None:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal and self.chat_encoding_spec in ("kimi_k3", "dsv41"):
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
-            # Standard VLMs render a text prompt (with placeholder strings) for the MM
-            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
-            # input_ids with single placeholders; pass those through so the MM processor
-            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
-            # encoding spec so every other model keeps the standard text path.
-            if (
-                self.chat_encoding_spec == "inkling"
-                and isinstance(processed_messages.prompt_ids, list)
-                and processed_messages.prompt_ids
-            ):
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"text": processed_messages.prompt}
-        else:
-            if isinstance(processed_messages.prompt_ids, str):
-                prompt_kwargs = {"text": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        engine_prompt = self._select_engine_prompt(
+            processed_messages,
+            is_multimodal,
+            input_ids_provided=request.input_ids is not None,
+        )
+        prompt_kwargs = (
+            {"text": engine_prompt}
+            if isinstance(engine_prompt, str)
+            else {"input_ids": engine_prompt}
+        )
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
@@ -1199,6 +1185,31 @@ class OpenAIServingChat(OpenAIServingBase):
             apply_header_overrides(adapted_request, raw_request.headers)
 
         return adapted_request, request
+
+    def _select_engine_prompt(
+        self,
+        processed: MessageProcessingResult,
+        is_multimodal: bool,
+        *,
+        input_ids_provided: bool = False,
+    ) -> Union[str, List[int]]:
+        """Share the native-token/text prompt contract across Chat and Responses.
+
+        V4.1/Kimi produce IDs even for text-only input on a vision-capable
+        model. Standard VLMs instead need their rendered text plus media.
+        Inkling supplies IDs only when its custom encoder populated them.
+        """
+        if input_ids_provided or not is_multimodal:
+            return processed.prompt_ids
+        if self.chat_encoding_spec in ("kimi_k3", "dsv41"):
+            return processed.prompt_ids
+        if (
+            self.chat_encoding_spec == "inkling"
+            and isinstance(processed.prompt_ids, list)
+            and processed.prompt_ids
+        ):
+            return processed.prompt_ids
+        return processed.prompt
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool

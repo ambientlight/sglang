@@ -41,6 +41,12 @@ V4.1-specific adaptations:
 - Preserve string-parameter whitespace, matching the pinned publisher decoder.
 - Preserve native inline system-message chronology; do not apply V4's
   latest-reminder transformation to V4.1.
+- Share Chat/Responses engine-prompt selection. The pinned Responses adapter
+  incorrectly selected the empty text field for native-ID vision encoders,
+  including text-only requests on V4.1. Preserve native IDs and image metadata;
+  keep standard VLMs on their existing rendered-text path. Coverage exercises
+  actual request conversion through both response modes, plain/tool output and
+  text/image input, not just post-generation stream parsing.
 - Preserve the pinned reasoning tiers (low=25, high=50, xhigh=75, max=100).
   Updating the publisher encoding revision/tier mapping is a separate change.
 - Missing sampling fields use the operator profile: temperature 1, top-p .95,
