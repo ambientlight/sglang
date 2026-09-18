@@ -64,6 +64,14 @@ benchmark repo additionally compares all five pinned publisher prompt goldens.
 Hardware and live endpoint qualification are separate gates, not inferred from
 these unit tests.
 
+See [Responses additive-prefix stability](deployment/RESPONSES_PREFIX_STABILITY.md)
+for the follow-up fix to Responses' pre-encoder system-message hoisting,
+captured-request token replay, regression coverage, and rollout limits. The
+September 18 local qualification was followed by an approved deployment of
+`ambientlight/dsv41-sm120:responses-prefix-v1`, with live additive-prefix and
+API checks. This follow-up was built from an explicitly hashed uncommitted
+snapshot before the local commit; its build manifest preserves that provenance.
+
 ## Deployment and HiCache reference
 
 See [RAM HiCache and SWA retention](deployment/HICACHE_SWA_RETENTION.md) for the

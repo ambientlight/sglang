@@ -1765,12 +1765,20 @@ class OpenAIServingResponses(OpenAIServingChat):
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
 
-        # Most chat templates expect a single leading ``system`` message;
-        # coalesce any ``instructions`` + interleaved ``developer`` entries.
+        # Most chat templates expect a single leading ``system`` message.
+        # V4.1 can encode inline system messages: only coalesce its initial
+        # instructions so appended developer/system updates do not rewrite
+        # the conversation prefix. Keep developer -> system normalization
+        # above; the native encoder does not treat developer as a system role.
+        preserve_inline_system = self.chat_encoding_spec == "dsv41"
         system_chunks: list[str] = []
         other_msgs: list = []
         for m in messages:
-            if isinstance(m, dict) and m.get("role") == "system":
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "system"
+                and not (preserve_inline_system and other_msgs)
+            ):
                 content = m.get("content")
                 if isinstance(content, str):
                     system_chunks.append(content)
