@@ -1,4 +1,4 @@
-"""Pinned 0xSero boot with deployment identity, auth and sampling controls.
+"""Pinned 0xSero boot with deployment identity, auth, sampling and scheduler controls.
 
 Source: 45f538a18569420721e00e37353f9a7e1af7e5da/boot.py.
 Hardware, checkpoint verification, startup and baseline smoke logic are unchanged.
@@ -150,12 +150,28 @@ def smoke():
     save('smoke-vision.json',visual)
     print('Structured output, tool round trip and full-budget native vision passed.',flush=True)
 
+def hicache_host_budget():
+    try:
+        hicache_budget = int(os.environ.get('DSV41_HICACHE_HOST_BUDGET_BYTES', '0'))
+    except ValueError as exc:
+        raise ValueError('DSV41_HICACHE_HOST_BUDGET_BYTES must be an integer') from exc
+    if not 0 <= hicache_budget <= 256_000_000_000:
+        raise ValueError('DSV41_HICACHE_HOST_BUDGET_BYTES must be 0 through 256000000000 (host total)')
+    return hicache_budget
+
 def serve():
+    hicache_budget = hicache_host_budget()
     mode = os.environ.get('OFFLOAD_MODE','nvme')
     assert mode in ('nvme','ram'), 'OFFLOAD_MODE must be nvme or ram'
     context = int(os.environ.get('CONTEXT_LENGTH','409600'))
     chunk = int(os.environ.get('CHUNKED_PREFILL_SIZE','2048'))
     assert 128 <= chunk <= context and chunk % 128 == 0, 'CHUNKED_PREFILL_SIZE must be a multiple of 128 within context'
+    try:
+        prefill_decode_interval = int(os.environ.get('PREFILL_DECODE_INTERVAL','0'))
+    except ValueError as exc:
+        raise ValueError('PREFILL_DECODE_INTERVAL must be a non-negative integer') from exc
+    if prefill_decode_interval < 0:
+        raise ValueError('PREFILL_DECODE_INTERVAL must be a non-negative integer')
     concurrency = int(os.environ.get('MAX_RUNNING_REQUESTS','8'))
     assert 1 <= concurrency <= 32, 'MAX_RUNNING_REQUESTS must be between 1 and 32'
     memory_fraction = float(os.environ.get('MEMORY_FRACTION','0.85'))
@@ -167,7 +183,7 @@ def serve():
     if mode == 'ram':
         index = json.loads((MODEL/'model.safetensors.index.json').read_text())['weight_map']
         shards = {index[f'layers.{layer}.engram.embed.weight'] for layer in (1,14)}
-        needed = sum((MODEL/name).stat().st_size for name in shards)+24*2**30
+        needed = sum((MODEL/name).stat().st_size for name in shards)+24*2**30+hicache_budget
         mem = dict(line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())
         available = int(mem['MemAvailable'].split()[0])*1024
         assert available >= needed, f'RAM offload needs at least {needed/2**30:.1f} GiB available; found {available/2**30:.1f}. Use nvme mode on a 128 GiB host.'
@@ -175,6 +191,7 @@ def serve():
         '--trust-remote-code','--load-format','safetensors','--tp','4','--ep-size','4',
         '--attention-backend','dsv4','--moe-runner-backend','flashinfer_mxfp4',
         '--mem-fraction-static',str(memory_fraction),'--chunked-prefill-size',str(chunk),
+        '--prefill-decode-interval',str(prefill_decode_interval),
         '--context-length',str(context),'--max-running-requests',str(concurrency),'--cuda-graph-max-bs-decode',str(concurrency),
         '--min-free-slots-delay','1','--random-seed','0','--speculative-algorithm','DSPARK','--speculative-dspark-block-size','5',
         '--enable-decoder-swa-bounded-replay','--tool-call-parser','deepseekv41',
@@ -183,6 +200,12 @@ def serve():
         total_tokens = int(os.environ['MAX_TOTAL_TOKENS'])
         assert total_tokens >= context, 'MAX_TOTAL_TOKENS must cover CONTEXT_LENGTH'
         args.extend(['--max-total-tokens',str(total_tokens)])
+    if hicache_budget:
+        if mode != 'ram':
+            raise ValueError('Bounded HiCache rollout requires RAM Engram offload')
+        args.extend(['--enable-hierarchical-cache', '--hicache-host-memory-mode', 'cache',
+                     '--hicache-write-policy', 'write_through', '--hicache-io-backend', 'kernel',
+                     '--hicache-mem-layout', 'page_first'])
     # API integration policy only: explicit request fields override these values.
     preferred = os.environ.get('DSV41_PREFERRED_SAMPLING_PARAMS',
                                '{"temperature":1.0,"top_p":0.95,"max_new_tokens":32768}')
@@ -190,7 +213,8 @@ def serve():
     args.extend(['--preferred-sampling-params',preferred,'--enable-metrics'])
     authenticated = require_api_key()
     save('launch.json',{'revision':REVISION,'offload_mode':mode,'args':args,'gpus':gpu,
-                        'require_api_key':authenticated,'served_model_name':served_model_name()})
+                        'require_api_key':authenticated,'served_model_name':served_model_name(),
+                        'hicache_host_budget_bytes':hicache_budget})
     secret = key()
     env = dict(os.environ,DSV41_SOURCE=str(MODEL))
     command = [sys.executable,'-m','sglang.launch_server',*args]

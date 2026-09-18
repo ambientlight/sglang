@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
@@ -453,6 +455,30 @@ def _deepseek_v4_num_host_pages(
             "DeepSeek V4 HiCache currently does not support --hicache-size; "
             "use --hicache-ratio instead."
         )
+    budget = int(os.environ.get("DSV41_HICACHE_HOST_BUDGET_BYTES", "0"))
+    if budget:
+        from sglang.srt.mem_cache.hybrid_cache.dsv41_host_budget import (
+            page_costs,
+            plan_pages,
+        )
+        from sglang.srt.mem_cache.pool_host.base import ranks_per_host
+
+        parallel = get_parallel()
+        if parallel.nnodes != 1 or parallel.tp_size != 4 or parallel.pp_size != 1:
+            raise ValueError("Bounded V4.1 HiCache requires single-node TP4 / PP1")
+        full_bytes, swa_bytes, full_meta, swa_meta = page_costs(kvcache, page_size, params.mtp_draft_device_pools)
+        plan = plan_pages(
+            budget_bytes=budget,
+            ranks=ranks_per_host(),
+            full_pages=device_full_pages,
+            swa_pages=device_swa_pages,
+            full_page_bytes=full_bytes,
+            swa_page_bytes=swa_bytes,
+            full_metadata_page_bytes=full_meta,
+            swa_metadata_page_bytes=swa_meta,
+        )
+        logger.info("DSV41_HICACHE_BUDGET %s", json.dumps({"rank": parallel.tp_rank, **plan}, sort_keys=True))
+        return plan["full_host_pages"], plan["swa_host_pages"]
     ratio = get_memory().hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
@@ -829,6 +855,30 @@ def build_deepseek_v4_hicache_stack(
         )
 
     entries.extend(_dsv4_low_ratio_entries(kvcache, page_size, num_host_pages))
+
+    budget = int(os.environ.get("DSV41_HICACHE_HOST_BUDGET_BYTES", "0"))
+    if budget:
+        # Check real allocations as well as the shape-based sizing calculation.
+        allocated = 0
+        for entry in entries:
+            pool = entry.host_pool
+            buffers = pool.kv_buffer
+            if buffers is not None:
+                allocated += sum(b.nbytes for b in buffers) if isinstance(buffers, list) else buffers.nbytes
+            allocated += pool.free_slots.nbytes
+        if allocated * 4 > budget:
+            raise ValueError("V4.1 HiCache actual host buffers exceeded the host-wide budget")
+        logger.info(
+            "DSV41_HICACHE_ALLOCATED %s",
+            json.dumps(
+                {
+                    "rank": get_parallel().tp_rank,
+                    "bytes_per_rank": allocated,
+                    "host_budget_bytes": budget,
+                },
+                sort_keys=True,
+            ),
+        )
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(

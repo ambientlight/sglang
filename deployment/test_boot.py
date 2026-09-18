@@ -34,8 +34,9 @@ class LaunchPolicyTest(unittest.TestCase):
         }
         with (
             tempfile.TemporaryDirectory() as temp,
-            patch.dict(boot.os.environ, env),
+            patch.dict(boot.os.environ, env, clear=True),
             patch.object(boot, "STATE", Path(temp)),
+            patch.object(boot, "MODEL", Path(temp)),
             patch.object(boot, "PORT", int(env["SERVER_PORT"])),
             patch.object(
                 boot.subprocess,
@@ -48,6 +49,9 @@ class LaunchPolicyTest(unittest.TestCase):
             patch.object(boot, "smoke"),
             patch.object(boot.signal, "signal"),
         ):
+            (Path(temp) / 'model.safetensors.index.json').write_text(json.dumps({'weight_map': {
+                'layers.1.engram.embed.weight': 'fixture.bin', 'layers.14.engram.embed.weight': 'fixture.bin'}}))
+            (Path(temp) / 'fixture.bin').write_bytes(b'fixture')
             self.assertEqual(boot.serve(), 0)
             self.command = start.call_args.args[0]
             self.manifest = json.loads((Path(temp) / "launch.json").read_text())
@@ -64,6 +68,7 @@ class LaunchPolicyTest(unittest.TestCase):
             ("--ep-size", "4"),
             ("--context-length", "409600"),
             ("--chunked-prefill-size", "2048"),
+            ("--prefill-decode-interval", "0"),
             ("--speculative-algorithm", "DSPARK"),
             ("--speculative-dspark-block-size", "5"),
         ):
@@ -73,6 +78,50 @@ class LaunchPolicyTest(unittest.TestCase):
         self.assertNotIn("fixture-key", json.dumps(args))
         self.assertIn("--api-key", self.command)
         self.assertTrue(self.manifest["require_api_key"])
+        self.assertNotIn('--enable-hierarchical-cache', args)
+        self.assertEqual(self.manifest['hicache_host_budget_bytes'], 0)
+
+    def test_ram_hicache_flags_do_not_enable_disk_storage(self):
+        args = self.launch({'OFFLOAD_MODE': 'ram', 'DSV41_HICACHE_HOST_BUDGET_BYTES': '1073741824'})
+        self.assertIn('--enable-hierarchical-cache', args)
+        self.assertEqual(args[args.index('--hicache-write-policy') + 1], 'write_through')
+        self.assertEqual(args[args.index('--hicache-host-memory-mode') + 1], 'cache')
+        self.assertNotIn('--hicache-size', args)
+        self.assertNotIn('--hicache-storage-backend', args)
+        self.assertEqual(self.manifest['hicache_host_budget_bytes'], 1073741824)
+
+    def test_invalid_host_budget_rejected_before_launch(self):
+        for value in ('-1', '256000000001', '1.5', 'garbage'):
+            with patch.dict(boot.os.environ, {'DSV41_HICACHE_HOST_BUDGET_BYTES': value}, clear=True), patch.object(boot.subprocess, 'Popen') as start:
+                with self.assertRaises(ValueError):
+                    boot.serve()
+                start.assert_not_called()
+
+    def test_256_gb_budget_and_192_gb_rollback_are_both_accepted(self):
+        for value in (0, 192_000_000_000, 256_000_000_000):
+            with patch.dict(boot.os.environ, {'DSV41_HICACHE_HOST_BUDGET_BYTES': str(value)}, clear=True):
+                self.assertEqual(boot.hicache_host_budget(), value)
+
+    def test_prefill_decode_interval_reaches_command_and_manifest(self):
+        args = self.launch({"PREFILL_DECODE_INTERVAL": "4"})
+        for command in (args, self.command):
+            self.assertEqual(command.count("--prefill-decode-interval"), 1)
+            self.assertEqual(command[command.index("--prefill-decode-interval") + 1], "4")
+            self.assertNotIn("--enable-mixed-chunk", command)
+            self.assertNotIn("--enable-two-batch-overlap", command)
+
+    def test_invalid_prefill_decode_interval_fails_before_hardware_or_launch(self):
+        for value in ("-1", "1.5", "", "four"):
+            with (
+                self.subTest(value=value),
+                patch.dict(boot.os.environ, {"PREFILL_DECODE_INTERVAL": value}, clear=True),
+                patch.object(boot.subprocess, "check_output") as probe,
+                patch.object(boot.subprocess, "Popen") as start,
+            ):
+                with self.assertRaisesRegex(ValueError, "PREFILL_DECODE_INTERVAL must be a non-negative integer"):
+                    boot.serve()
+                probe.assert_not_called()
+                start.assert_not_called()
 
     def test_legacy_endpoint_keeps_native_v41_parsers(self):
         args = self.launch({
