@@ -633,6 +633,10 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Python TreeCore / persistent HiCache only. Prefer retaining the SWA
+    # windows at real request boundaries over intermediate chunk checkpoints.
+    # A second eviction pass still reclaims them when the bounded pool is full.
+    SGLANG_OPT_HICACHE_SWA_RETAIN_REQUEST_BOUNDARIES = EnvBool(False)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # Deprecated: the unified radix tree is the default tree cache now, so the

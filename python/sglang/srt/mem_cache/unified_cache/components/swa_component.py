@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -81,11 +82,86 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        self.retain_host_request_boundaries = (
+            envs.SGLANG_OPT_HICACHE_SWA_RETAIN_REQUEST_BOUNDARIES.get()
+        )
+        if (
+            self.retain_host_request_boundaries
+            and envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python"
+        ):
+            raise ValueError(
+                "HiCache SWA request-boundary retention requires Python TreeCore"
+            )
+        self.host_evicted_tokens = 0
+        self.host_boundary_evicted_tokens = 0
 
     component_type = ComponentType.SWA
 
+    def _retain_host_boundaries_enabled(self) -> bool:
+        return (
+            self.retain_host_request_boundaries
+            and self.tree_core.enable_hicache
+            and self.tree_core.has_swa_host_pool
+            and self.cache.host_memory_mode == "cache"
+        )
+
+    def _remember_host_request_boundary(
+        self, node: UnifiedTreeNode, params: InsertParams
+    ) -> None:
+        """Soft-prioritize reusable SWA windows, without pins or new allocations.
+
+        Intermediate chunk inserts are not request boundaries. Keep one window
+        plus one page at a real boundary: exact prompt replay holds back its
+        final token and can therefore match one page before the insertion end.
+        Existing node granularity may retain more, but never weakens matching.
+        """
+        if params.chunked or not self._retain_host_boundaries_enabled():
+            return
+        remaining = self.sliding_window_size + self.tree_core.page_size
+        while node is not self.tree_core.root_node and remaining > 0:
+            node.component_data[self.component_type].metadata[
+                "host_request_boundary"
+            ] = True
+            remaining -= len(node.key)
+            node = node.parent
+
+    def _collect_unbacked_swa_nodes(
+        self, node: UnifiedTreeNode
+    ) -> list[UnifiedTreeNode]:
+        """Upstream window-scoped incremental SWA backup, deepest first.
+
+        Buffer-only mode must keep its node-local FIFO transfer contract. In
+        persistent cache mode, repaired SWA can need backup even if Full KV
+        (or the boundary node's SWA) is already backed up.
+        """
+        if not self.tree_core.has_swa_host_pool:
+            return []
+        if self.cache.host_memory_mode == "buffer_only":
+            return (
+                [node]
+                if node.component_data[self.component_type].value is not None
+                else []
+            )
+        # Unlike soft retention, an asynchronous backup must not include the
+        # replay-lookbehind page: its device lock covers only one SWA window.
+        span = self.sliding_window_size
+        covered = 0
+        unbacked = []
+        while node is not self.tree_core.root_node and covered < span:
+            if node.write_through_pending_id is not None:
+                break
+            cd = node.component_data[self.component_type]
+            value = cd.value if cd.value is not None else cd.host_value
+            if value is None:
+                break
+            covered += len(value)
+            if cd.value is not None and cd.host_value is None:
+                unbacked.append(node)
+            node = node.parent
+        return unbacked
+
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return False
+        return bool(self._collect_unbacked_swa_nodes(node))
 
     def reset_session_state(self) -> None:
         super().reset_session_state()
@@ -467,6 +543,7 @@ class SWAComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         if not is_new_leaf:
+            self._remember_host_request_boundary(node, params)
             return
 
         node_start = result.prefix_len
@@ -502,6 +579,7 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value,
             )
         )
+        self._remember_host_request_boundary(node, params)
 
     def _maybe_split_leaf_for_swa_lock(
         self, leaf: UnifiedTreeNode
@@ -554,6 +632,13 @@ class SWAComponent(TreeComponent):
             new_parent.component_data[self.component_type].value = None
 
         child_swa_host_value = child.component_data[self.component_type].host_value
+        parent_swa_data = new_parent.component_data[self.component_type]
+        child_swa_data = child.component_data[self.component_type]
+        # Upstream #38138 / #38835: both fragments remain pinned until the
+        # asynchronous host transfer completes, including its window boundary.
+        parent_swa_data.host_lock_ref = child_swa_data.host_lock_ref
+        if child_swa_data.metadata.get("host_request_boundary"):
+            parent_swa_data.metadata["host_request_boundary"] = True
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
             new_parent.component_data[
@@ -563,11 +648,13 @@ class SWAComponent(TreeComponent):
                 split_len:
             ].clone()
             host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if new_parent.component_data[self.component_type].value is None:
+            if parent_swa_data.value is None and parent_swa_data.host_lock_ref == 0:
                 host_lru.insert_mru(new_parent)
-            if child.component_data[
-                self.component_type
-            ].value is None and not host_lru.in_list(child):
+            if (
+                child_swa_data.value is None
+                and child_swa_data.host_lock_ref == 0
+                and not host_lru.in_list(child)
+            ):
                 host_lru.insert_mru(child)
 
         # parent inherits the swa_uuid from child for swa lock ref
@@ -575,6 +662,9 @@ class SWAComponent(TreeComponent):
             child.component_data[self.component_type].metadata.get("uuid")
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
+        parent_swa_data.metadata["host_uuid"] = child_swa_data.metadata.pop(
+            "host_uuid", None
+        )
 
     def evict_component(
         self,
@@ -604,6 +694,9 @@ class SWAComponent(TreeComponent):
         host_lru = self.tree_core.host_lru_lists[ct]
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
+            self.host_evicted_tokens += host_freed
+            if cd.metadata.get("host_request_boundary"):
+                self.host_boundary_evicted_tokens += host_freed
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
             if host_lru.in_list(node):
@@ -933,15 +1026,17 @@ class SWAComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            cd = node.component_data[ct]
-            if cd.value is None:
+            nodes = self._collect_unbacked_swa_nodes(node)
+            if not nodes:
                 return None
-            # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pool indexing wants int64.
+            nodes.reverse()
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=cd.value.to(torch.int64),
+                    device_indices=torch.cat(
+                        [n.component_data[ct].value for n in nodes]
+                    ).to(torch.int64),
+                    nodes_to_load=[n.id for n in nodes],
                 )
             ]
 
@@ -1120,10 +1215,18 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
-            if transfers and transfers[0].host_indices is not None:
-                cd = node.component_data[ct]
-                if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+            if not transfers or transfers[0].host_indices is None:
+                return
+            xfer = transfers[0]
+            offset = 0
+            for node_id in xfer.nodes_to_load or [node.id]:
+                target = self.tree_core.node_by_id(node_id)
+                cd = target.component_data[ct]
+                assert cd.value is not None and cd.host_value is None
+                size = len(cd.value)
+                cd.host_value = xfer.host_indices[offset : offset + size].clone()
+                offset += size
+            assert offset == len(xfer.host_indices)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -1279,49 +1382,76 @@ class SWAComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Evict SWA host resources.
+        """Evict SWA host resources, preferring expendable chunk checkpoints.
         Internal nodes: private tombstone (free SWA host only).
-        Host leaves: atomic eviction via _evict_host_leaf."""
+        Host leaves: atomic eviction via _evict_host_leaf.
+
+        Boundary retention is a preference, never a pin. The second pass can
+        drain retained windows. Session priority and host IO locks still win.
+        No node splitting or device-memory allocation is done while reclaiming.
+        """
         ct = self.component_type
         host_lru = self.tree_core.host_lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
-        if enabled:
-            host_lru.cursor_begin()
-            x = host_lru.cursor_next(host_lock=True)
+        if self._retain_host_boundaries_enabled():
+            partitions = (False, True) if enabled else (None,)
+            passes = [
+                (partition, defer)
+                for partition in partitions
+                for defer in (True, False)
+            ]
         else:
-            x = host_lru.get_lru_no_host_lock()
-        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            if not enabled:
-                x_next = host_lru.get_prev_no_host_lock(x)
-            cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves and (
-                not enabled or self._can_evict_leaf_atomically(x)
-            ):
-                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
-            else:
-                assert cd.host_value is not None
-                self.tree_core._evict_component_and_detach_lru(
-                    x,
-                    self,
-                    target=EvictLayer.HOST,
-                    tracker=tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                )
-                self.tree_core._cascade_evict(
-                    x,
-                    self,
-                    tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                    target=EvictLayer.HOST,
-                )
+            passes = [(None, False)]
+        for referenced, defer_boundaries in passes:
+            if tracker[ct] >= num_tokens:
+                break
             if enabled:
+                host_lru.cursor_begin()
                 x = host_lru.cursor_next(host_lock=True)
             else:
-                x = x_next
-        if enabled:
-            host_lru.cursor_end()
+                x = host_lru.get_lru_no_host_lock()
+            try:
+                while (
+                    tracker[ct] < num_tokens and x is not None and host_lru.in_list(x)
+                ):
+                    if not enabled:
+                        x_next = host_lru.get_prev_no_host_lock(x)
+                    cd = x.component_data[ct]
+                    skip = (
+                        referenced is not None and bool(cd.session_ref) != referenced
+                    ) or (
+                        defer_boundaries
+                        and cd.metadata.get("host_request_boundary", False)
+                    )
+                    if not skip:
+                        if x in self.tree_core.evictable_host_leaves and (
+                            not enabled or self._can_evict_leaf_atomically(x)
+                        ):
+                            self.tree_core._evict_host_leaf(
+                                x, tracker, device_frees, host_frees
+                            )
+                        else:
+                            assert cd.host_value is not None
+                            self.tree_core._evict_component_and_detach_lru(
+                                x,
+                                self,
+                                target=EvictLayer.HOST,
+                                tracker=tracker,
+                                device_frees=device_frees,
+                                host_frees=host_frees,
+                            )
+                            self.tree_core._cascade_evict(
+                                x,
+                                self,
+                                tracker,
+                                device_frees=device_frees,
+                                host_frees=host_frees,
+                                target=EvictLayer.HOST,
+                            )
+                    x = host_lru.cursor_next(host_lock=True) if enabled else x_next
+            finally:
+                if enabled:
+                    host_lru.cursor_end()
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._swa_kv_pool_host is None:

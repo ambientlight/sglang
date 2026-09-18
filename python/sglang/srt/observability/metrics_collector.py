@@ -153,6 +153,11 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_swa_host_used_tokens: int = 0
+    hicache_swa_host_total_tokens: int = 0
+    hicache_swa_host_evicted_tokens: int = 0
+    hicache_swa_host_boundary_evicted_tokens: int = 0
+    hicache_swa_host_retention_enabled: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -648,6 +653,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            self.hicache_swa_host_gauges = {
+                name: Gauge(
+                    name="sglang:" + name,
+                    documentation=description,
+                    labelnames=labels.keys(),
+                    multiprocess_mode="mostrecent",
+                )
+                for name, description in {
+                    "hicache_swa_host_used_tokens": "Used SWA host token slots on this rank, separate from Full KV.",
+                    "hicache_swa_host_total_tokens": "Bounded SWA host token-slot capacity on this rank.",
+                    "hicache_swa_host_evicted_tokens": "Cumulative SWA host slots evicted since this cache was constructed; snapshot gauge.",
+                    "hicache_swa_host_boundary_evicted_tokens": "Cumulative request-boundary SWA host slots evicted, including Full-driven eviction; snapshot gauge.",
+                    "hicache_swa_host_retention_enabled": "Whether soft request-boundary SWA host retention is active (0 or 1).",
+                }.items()
+            }
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -1402,6 +1422,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for name, gauge in self.hicache_swa_host_gauges.items():
+                self._log_gauge(gauge, getattr(stats, name))
 
         # Streaming session metrics
         if self.enable_streaming_session:

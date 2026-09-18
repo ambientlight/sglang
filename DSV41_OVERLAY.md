@@ -13,8 +13,9 @@ of current upstream SGLang, and its original Git revision is unresolved.
   `2c03d62532c880d17ef356c24275d1f7117c1d69`.
 
 The Engram adapter/import hooks and all binary dependencies remain supplied by
-the pinned recipe/image. Keep the overlay limited to reviewed API/parser files;
-do not replace kernels or dependency versions as part of this API port.
+the pinned recipe/image. Keep the overlay limited to reviewed API/parser,
+deployment, and explicitly qualified cache changes; do not replace kernels or
+dependency versions as part of these integrations.
 
 The initial import commit records provenance, not hardware qualification. Prepare
 and run CPU regressions independently, then qualify on top of the reproduced
@@ -63,7 +64,21 @@ benchmark repo additionally compares all five pinned publisher prompt goldens.
 Hardware and live endpoint qualification are separate gates, not inferred from
 these unit tests.
 
-## Legacy endpoint promotion
+## Deployment and HiCache reference
+
+See [RAM HiCache and SWA retention](deployment/HICACHE_SWA_RETENTION.md) for the
+complete configuration, host-total budget calculation, cache lifecycle,
+upstream backport rationale, metrics, tests, qualification evidence, build
+provenance, and rollback procedure.
+
+The September 18, 2026 UTC qualified profile uses RAM Engram offload, a
+256,000,000,000-byte host-wide HiCache budget, static fraction 0.87, and prefill
+decode interval 4. SWA request-boundary retention is explicitly enabled on
+Python TreeCore. Both FULL KV and SWA windows are stored in RAM and restored to
+GPU on a hit. Retention is a bounded eviction preference, not permanent pinning.
+The API containment and hardware baseline described above are preserved.
+
+## Legacy endpoint promotion (initial profile)
 
 The boot wrapper accepts `SERVED_MODEL_NAME` and the existing `SERVER_PORT` to
 publish V4.1 behind the V12-compatible `deepseek-v4-flash` alias on port 8000.
@@ -73,7 +88,7 @@ checks follow these settings. Parser/encoder selection remains native V4.1,
 independent of the public model alias; no kernel or serving implementation is
 replaced by this deployment change.
 
-The promoted Compose profile selects context 524288, container `dsv41`, and
+The initial promoted Compose profile selected context 524288, container `dsv41`, and
 `unless-stopped`, preserving TP4/EP4, 2048-token prefill, memory fraction 0.85,
 eight request slots, and DSPARK block 5. The V12 durable thinking key is retained
 for legacy history compatibility: its signed payload binds to the public model

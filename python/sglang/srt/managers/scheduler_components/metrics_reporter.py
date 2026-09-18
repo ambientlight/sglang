@@ -1123,6 +1123,31 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+        # Full host occupancy alone cannot show whether a hybrid prefix is
+        # reusable. SWA has an independent capacity and eviction lifecycle.
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        swa = getattr(self.scheduler.tree_cache, "components", {}).get(
+            ComponentType.SWA
+        )
+        swa_host = getattr(swa, "_swa_kv_pool_host", None)
+        self.stats.hicache_swa_host_used_tokens = (
+            swa_host.logical_size - swa_host.available_size()
+            if swa_host is not None
+            else 0
+        )
+        self.stats.hicache_swa_host_total_tokens = (
+            swa_host.logical_size if swa_host is not None else 0
+        )
+        self.stats.hicache_swa_host_evicted_tokens = getattr(
+            swa, "host_evicted_tokens", 0
+        )
+        self.stats.hicache_swa_host_boundary_evicted_tokens = getattr(
+            swa, "host_boundary_evicted_tokens", 0
+        )
+        self.stats.hicache_swa_host_retention_enabled = int(
+            swa is not None and swa._retain_host_boundaries_enabled()
+        )
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
