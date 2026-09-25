@@ -449,6 +449,7 @@ class RetentionMetricsTests(unittest.TestCase):
                         logical_size=16384, available_size=lambda: 8192
                     ),
                     components={S: f.swa},
+                    tree_core=f.tree,
                 ),
             ),
             stats=stats,
@@ -505,6 +506,12 @@ class RetentionMetricsTests(unittest.TestCase):
             self.assertEqual(
                 registry.get_sample_value("sglang:" + name, labels), value
             )
+        self.assertEqual(registry.get_sample_value("sglang:hicache_swa_diagnostics_enabled", labels), 1)
+        self.assertEqual(registry.get_sample_value("sglang:hicache_full_host_tree_tokens", labels), 2048)
+        self.assertEqual(registry.get_sample_value("sglang:hicache_full_host_swa_uncovered_tokens", labels), 0)
+        cause_labels = {**labels, "trigger": "swa_pressure", "disposition": "swa_only"}
+        self.assertEqual(registry.get_sample_value("sglang:hicache_swa_host_evicted_tokens_by_cause", cause_labels), 256)
+        self.assertEqual(registry.get_sample_value("sglang:hicache_swa_host_boundary_evicted_tokens_by_cause", cause_labels), 0)
 
     def test_reporter_without_swa_has_zero_auxiliary_metrics(self):
         from sglang.srt.managers.scheduler_components.metrics_reporter import (

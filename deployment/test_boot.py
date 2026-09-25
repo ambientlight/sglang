@@ -48,12 +48,16 @@ class LaunchPolicyTest(unittest.TestCase):
             patch.object(boot, "request"),
             patch.object(boot, "smoke"),
             patch.object(boot.signal, "signal"),
+            patch.object(boot, "ServerLogForwarder") as forwarder,
         ):
+            forwarder.return_value.wait.return_value = 0
+            forwarder.return_value.stop_requested = False
             (Path(temp) / 'model.safetensors.index.json').write_text(json.dumps({'weight_map': {
                 'layers.1.engram.embed.weight': 'fixture.bin', 'layers.14.engram.embed.weight': 'fixture.bin'}}))
             (Path(temp) / 'fixture.bin').write_bytes(b'fixture')
             self.assertEqual(boot.serve(), 0)
             self.command = start.call_args.args[0]
+            self.popen_kwargs = start.call_args.kwargs
             self.manifest = json.loads((Path(temp) / "launch.json").read_text())
             return self.manifest["args"]
 
@@ -80,6 +84,9 @@ class LaunchPolicyTest(unittest.TestCase):
         self.assertTrue(self.manifest["require_api_key"])
         self.assertNotIn('--enable-hierarchical-cache', args)
         self.assertEqual(self.manifest['hicache_host_budget_bytes'], 0)
+        self.assertNotIn('text', self.popen_kwargs)
+        self.assertEqual(self.popen_kwargs['bufsize'], 0)
+        self.assertTrue(self.popen_kwargs['start_new_session'])
 
     def test_ram_hicache_flags_do_not_enable_disk_storage(self):
         args = self.launch({'OFFLOAD_MODE': 'ram', 'DSV41_HICACHE_HOST_BUDGET_BYTES': '1073741824'})
@@ -96,6 +103,24 @@ class LaunchPolicyTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     boot.serve()
                 start.assert_not_called()
+
+    def test_payload_fraction_is_recorded_and_forwarded_without_gpu_changes(self):
+        self.launch({'OFFLOAD_MODE': 'ram', 'DSV41_HICACHE_HOST_BUDGET_BYTES': '1073741824',
+                     'DSV41_HICACHE_SWA_FRACTION': '0.236'})
+        self.assertEqual(self.manifest['hicache_swa_payload_fraction'], '0.236')
+        self.assertEqual(self.manifest['hicache_host_budget_bytes'], 1073741824)
+
+    def test_invalid_fraction_rejected_before_hardware_or_launch(self):
+        for value, cap in ((x, '256000000000') for x in ('0', '1', '-1', 'nan', 'inf', '', 'no')):
+            with self.subTest(value=value), patch.dict(boot.os.environ, {
+                'DSV41_HICACHE_SWA_FRACTION': value, 'DSV41_HICACHE_HOST_BUDGET_BYTES': cap}, clear=True), \
+                patch.object(boot.subprocess, 'check_output') as hardware:
+                with self.assertRaises(ValueError):
+                    boot.serve()
+                hardware.assert_not_called()
+        with patch.dict(boot.os.environ, {'DSV41_HICACHE_SWA_FRACTION': '0.236'}, clear=True):
+            with self.assertRaises(ValueError):
+                boot.hicache_host_budget()
 
     def test_256_gb_budget_and_192_gb_rollback_are_both_accepted(self):
         for value in (0, 192_000_000_000, 256_000_000_000):

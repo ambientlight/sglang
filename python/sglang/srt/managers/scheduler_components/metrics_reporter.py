@@ -1148,6 +1148,19 @@ class SchedulerMetricsReporter:
         self.stats.hicache_swa_host_retention_enabled = int(
             swa is not None and swa._retain_host_boundaries_enabled()
         )
+        core = getattr(self.scheduler.tree_cache, "tree_core", None)
+        diagnostics = getattr(core, "host_cache_diagnostics", None)
+        (
+            self.stats.hicache_swa_diagnostics,
+            self.stats.hicache_swa_host_evicted_by_cause,
+            self.stats.hicache_swa_host_boundary_evicted_by_cause,
+        ) = (
+            diagnostics.snapshot(
+                core, census=getattr(self.scheduler, "tp_rank", 0) == 0
+            )
+            if diagnostics is not None
+            else ({}, {}, {})
+        )
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

@@ -456,6 +456,9 @@ def _deepseek_v4_num_host_pages(
             "use --hicache-ratio instead."
         )
     budget = int(os.environ.get("DSV41_HICACHE_HOST_BUDGET_BYTES", "0"))
+    swa_fraction = os.environ.get("DSV41_HICACHE_SWA_FRACTION")
+    if swa_fraction is not None and not budget:
+        raise ValueError("DSV41_HICACHE_SWA_FRACTION requires a nonzero host budget")
     if budget:
         from sglang.srt.mem_cache.hybrid_cache.dsv41_host_budget import (
             page_costs,
@@ -476,6 +479,7 @@ def _deepseek_v4_num_host_pages(
             swa_page_bytes=swa_bytes,
             full_metadata_page_bytes=full_meta,
             swa_metadata_page_bytes=swa_meta,
+            swa_fraction=swa_fraction,
         )
         logger.info("DSV41_HICACHE_BUDGET %s", json.dumps({"rank": parallel.tp_rank, **plan}, sort_keys=True))
         return plan["full_host_pages"], plan["swa_host_pages"]

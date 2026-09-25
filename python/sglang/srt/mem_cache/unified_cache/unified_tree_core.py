@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -62,6 +61,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
+)
+from sglang.srt.mem_cache.unified_cache.host_cache_diagnostics import (
+    HostCacheDiagnostics,
+    host_eviction_operation,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -428,6 +431,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             enabled=params.enable_kv_cache_events, page_size=self.page_size
         )
 
+        self.host_cache_diagnostics = HostCacheDiagnostics()
         self.reset()
 
     # ==== Tree API ====
@@ -440,6 +444,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        self.host_cache_diagnostics.invalidate_census()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -746,6 +751,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node = node
         best_match_device_value_len = 0
         full_kv_hit_length = 0
+        diagnostic_match = self.host_cache_diagnostics.supported(self)
+        host_matched_length = best_host_matched_length = best_matched_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         if separate_device_match:
@@ -768,9 +775,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         def _update_best_if_valid(node):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
+            nonlocal best_matched_length, best_host_matched_length
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                best_matched_length = full_kv_hit_length
+                best_host_matched_length = host_matched_length
 
             if not separate_device_match:
                 if matched:
@@ -790,6 +800,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
+            if diagnostic_match and child.backuped:
+                host_matched_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -805,6 +817,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
 
+        if diagnostic_match:
+            self.host_cache_diagnostics.observe_match(
+                full_kv_hit_length,
+                best_matched_length,
+                host_matched_length,
+                best_host_matched_length,
+            )
         return (
             value,
             best_match_node,
@@ -1439,6 +1458,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result.is_dropped = True
         return result
 
+    @host_eviction_operation
     def _release_all_component_layers(
         self,
         node: UnifiedTreeNode,
@@ -1487,20 +1507,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         write_back, FULL pressure reclaims redundant Full host copies first."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
-        if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
-                self._reclaim_full_host_duplicates(
+        trigger = {
+            ComponentType.SWA: "swa_pressure",
+            ComponentType.FULL: "full_pressure",
+        }.get(component_type, "other")
+        with self.host_cache_diagnostics.eviction_scope(trigger):
+            if comp is not None:
+                if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
+                    self._reclaim_full_host_duplicates(
+                        num_tokens,
+                        result.tracker,
+                        result.device_frees,
+                        result.host_frees,
+                    )
+                comp.drive_host_eviction(
                     num_tokens,
                     result.tracker,
                     result.device_frees,
                     result.host_frees,
                 )
-            comp.drive_host_eviction(
-                num_tokens,
-                result.tracker,
-                result.device_frees,
-                result.host_frees,
-            )
         return result
 
     def evict_excess_path_states(
@@ -1581,6 +1606,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
         ) & _RECLAIM_DIGEST_MASK
 
+    @host_eviction_operation
     def _evict_host_leaf(
         self,
         node: UnifiedTreeNode,
@@ -1648,6 +1674,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         self._update_evictable_leaf_sets(node.parent)
 
+    @host_eviction_operation
     def _cascade_evict(
         self,
         node: UnifiedTreeNode,
@@ -1756,6 +1783,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         had_host_copy = node.component_data[comp.component_type].host_value is not None
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
+        )
+        self.host_cache_diagnostics.record_freed(
+            node.id,
+            comp.component_type,
+            host_freed,
+            bool(
+                node.component_data[comp.component_type].metadata.get(
+                    "host_request_boundary"
+                )
+            ),
         )
         if tracker is not None:
             if EvictLayer.DEVICE in target:
@@ -2164,8 +2201,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             for nid in kv_xfer.nodes_to_load or ():
                 pinned = self.node_by_id(nid)
                 assert pinned.load_back_pending_id in (None, node_id), (
-                    f"node {nid} pinned by load-back "
-                    f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                    f"node {nid} pinned by load-back {pinned.load_back_pending_id}, new anchor {node_id}"
                 )
                 pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
@@ -2415,8 +2451,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru_ids = set(lru.cache.keys())
                 if tree_ids != lru_ids:
                     E(
-                        f"{ct} device LRU: "
-                        f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
+                        f"{ct} device LRU: +tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
                 # Aux host-only states must match the host LRU.
                 host_lru = self.host_lru_lists[ct]
@@ -2430,8 +2465,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 host_lru_ids = set(host_lru.cache.keys())
                 if s3_ids != host_lru_ids:
                     E(
-                        f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"{ct} host LRU: +S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids
@@ -2457,13 +2491,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         evictable += toks
             if self.component_evictable_size_[ct] != evictable:
                 E(
-                    f"[Size] {ct} evictable={self.component_evictable_size_[ct]} "
-                    f"!= recomputed={evictable}"
+                    f"[Size] {ct} evictable={self.component_evictable_size_[ct]} != recomputed={evictable}"
                 )
             if self.component_protected_size_[ct] != protected:
                 E(
-                    f"[Size] {ct} protected={self.component_protected_size_[ct]} "
-                    f"!= recomputed={protected}"
+                    f"[Size] {ct} protected={self.component_protected_size_[ct]} != recomputed={protected}"
                 )
 
         # ── PART 5: Ongoing Operations ──
@@ -2492,14 +2524,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 and node.load_back_pending_id not in ongoing_load_ids
             ):
                 E(
-                    f"[Ongoing] node {node.id} load_back_pending_id="
-                    f"{node.load_back_pending_id} has no live load-back"
+                    f"[Ongoing] node {node.id} load_back_pending_id={node.load_back_pending_id} has no live load-back"
                 )
 
         if errors:
             msg = (
-                f"Sanity check FAILED ({len(errors)} violations "
-                f"across {len(all_nodes)} nodes):\n"
+                f"Sanity check FAILED ({len(errors)} violations across {len(all_nodes)} nodes):\n"
                 + "\n".join(f"  {e}" for e in errors)
             )
             logger.error(msg)

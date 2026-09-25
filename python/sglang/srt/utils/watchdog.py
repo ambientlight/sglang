@@ -146,10 +146,6 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
@@ -158,9 +154,18 @@ class WatchdogRaw:
         print(file=sys.stdout, flush=True)
 
         if not self.soft:
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
+            # The parent coordinates bounded, all-rank evidence collection.
+            # Never put callbacks or ptrace ahead of this fatal notification.
             self.parent_process.send_signal(signal.SIGQUIT)
+            return
+
+        # A soft watchdog is diagnostic only; preserve its no-kill semantics.
+        try:
+            if self.dump_info is not None and (info_msg := self.dump_info()):
+                logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+        except Exception:
+            logger.exception("%s watchdog debug callback failed", self.debug_name)
+        pyspy_dump_schedulers()
 
 
 class SubprocessWatchdog:

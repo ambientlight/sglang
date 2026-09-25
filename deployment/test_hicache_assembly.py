@@ -32,6 +32,12 @@ class Paged(Logical):
 
 class AssemblyTest(unittest.TestCase):
     def test_real_low_ratio_shapes_match_bounded_plan_and_allocated_total(self):
+        self.exercise_layout(None)
+
+    def test_payload_split_with_real_assembler_and_packed_draft(self):
+        self.exercise_layout("0.236")
+
+    def exercise_layout(self, fraction):
         swa = lambda n: NS(
             kv_buffer=[torch.zeros((30, 2048), dtype=torch.uint8) for _ in range(n)], bytes_per_page_padded=2048
         )
@@ -78,8 +84,14 @@ class AssemblyTest(unittest.TestCase):
             hicache_io_backend="kernel",
             hicache_host_memory_mode="cache",
         )
+        # This synthetic layout has much more slot metadata per payload byte
+        # than production. The explicit split still must fit one GPU equivalent.
+        cap = 1_500_000_000 if fraction is not None else 1_100_000_000
+        env = {"DSV41_HICACHE_HOST_BUDGET_BYTES": str(cap)}
+        if fraction is not None:
+            env["DSV41_HICACHE_SWA_FRACTION"] = fraction
         with (
-            patch.dict(os.environ, {"DSV41_HICACHE_HOST_BUDGET_BYTES": "1100000000"}),
+            patch.dict(os.environ, env, clear=True),
             patch.object(assembly, "get_memory", return_value=memory),
             patch.object(assembly, "get_parallel", return_value=NS(nnodes=1, tp_size=4, pp_size=1, tp_rank=0)),
             patch("sglang.srt.mem_cache.pool_host.base.ranks_per_host", return_value=4),
@@ -96,13 +108,15 @@ class AssemblyTest(unittest.TestCase):
         swa_pages = group.entries[1].host_pool.size // 64
         actual_payload = sum(e.host_pool.kv_buffer.nbytes for e in group.entries if e.host_pool.kv_buffer)
         self.assertEqual(actual_payload, full_bytes * full_pages + swa_bytes * swa_pages)
+        if fraction is not None:
+            self.assertAlmostEqual(swa_bytes * swa_pages / actual_payload, float(fraction), delta=0.02)
         self.assertLessEqual(
             sum(
                 (e.host_pool.kv_buffer.nbytes if e.host_pool.kv_buffer else 0) + e.host_pool.free_slots.nbytes
                 for e in group.entries
             )
             * 4,
-            1100000000,
+            cap,
         )
 
 

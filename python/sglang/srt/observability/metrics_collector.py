@@ -24,6 +24,15 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.unified_cache.host_cache_diagnostics import (
+    DISPOSITIONS as HOST_EVICTION_DISPOSITIONS,
+)
+from sglang.srt.mem_cache.unified_cache.host_cache_diagnostics import (
+    GAUGES as HOST_CACHE_DIAGNOSTIC_GAUGES,
+)
+from sglang.srt.mem_cache.unified_cache.host_cache_diagnostics import (
+    TRIGGERS as HOST_EVICTION_TRIGGERS,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
@@ -40,7 +49,6 @@ from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 if TYPE_CHECKING:
     from prometheus_client import Gauge
-
     from sglang.srt.managers.schedule_batch import Req
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -158,6 +166,13 @@ class SchedulerStats:
     hicache_swa_host_evicted_tokens: int = 0
     hicache_swa_host_boundary_evicted_tokens: int = 0
     hicache_swa_host_retention_enabled: int = 0
+    hicache_swa_diagnostics: Dict[str, float] = field(default_factory=dict)
+    hicache_swa_host_evicted_by_cause: Dict[str, Dict[str, int]] = field(
+        default_factory=dict
+    )
+    hicache_swa_host_boundary_evicted_by_cause: Dict[str, Dict[str, int]] = field(
+        default_factory=dict
+    )
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -668,6 +683,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     "hicache_swa_host_retention_enabled": "Whether soft request-boundary SWA host retention is active (0 or 1).",
                 }.items()
             }
+            self.hicache_swa_diagnostic_gauges = {
+                name: Gauge(
+                    name="sglang:" + name,
+                    documentation=description,
+                    labelnames=labels.keys(),
+                    multiprocess_mode="mostrecent",
+                )
+                for name, description in HOST_CACHE_DIAGNOSTIC_GAUGES.items()
+            }
+            self.hicache_swa_eviction_gauges = {
+                field_name: Gauge(
+                    name="sglang:" + metric_name,
+                    documentation="Cumulative SWA host slots actually freed, by initiating pressure and whether FULL host state on that node was also freed in the operation; snapshot gauge.",
+                    labelnames=[*labels.keys(), "trigger", "disposition"],
+                    multiprocess_mode="mostrecent",
+                )
+                for field_name, metric_name in (
+                    (
+                        "hicache_swa_host_evicted_by_cause",
+                        "hicache_swa_host_evicted_tokens_by_cause",
+                    ),
+                    (
+                        "hicache_swa_host_boundary_evicted_by_cause",
+                        "hicache_swa_host_boundary_evicted_tokens_by_cause",
+                    ),
+                )
+            }
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -931,32 +973,28 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
-                "Total time that GPU is busy executing model forward passes. "
-                "Refer to ForwardMode for category labels."
+                "Total time that GPU is busy executing model forward passes. Refer to ForwardMode for category labels."
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
-                "Estimated number of floating point operations per GPU "
-                "(for Model FLOPs Utilization calculations)."
+                "Estimated number of floating point operations per GPU (for Model FLOPs Utilization calculations)."
             ),
             labelnames=labels.keys(),
         )
         self.estimated_read_bytes_per_gpu_total = Counter(
             name="sglang:estimated_read_bytes_per_gpu_total",
             documentation=(
-                "Estimated number of bytes read from memory per GPU "
-                "(for Model FLOPs Utilization calculations)."
+                "Estimated number of bytes read from memory per GPU (for Model FLOPs Utilization calculations)."
             ),
             labelnames=labels.keys(),
         )
         self.estimated_write_bytes_per_gpu_total = Counter(
             name="sglang:estimated_write_bytes_per_gpu_total",
             documentation=(
-                "Estimated number of bytes written to memory per GPU "
-                "(for Model FLOPs Utilization calculations)."
+                "Estimated number of bytes written to memory per GPU (for Model FLOPs Utilization calculations)."
             ),
             labelnames=labels.keys(),
         )
@@ -1424,6 +1462,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
             for name, gauge in self.hicache_swa_host_gauges.items():
                 self._log_gauge(gauge, getattr(stats, name))
+            for name, gauge in self.hicache_swa_diagnostic_gauges.items():
+                self._log_gauge(gauge, stats.hicache_swa_diagnostics.get(name, 0))
+            for field_name, gauge in self.hicache_swa_eviction_gauges.items():
+                values = getattr(stats, field_name)
+                for trigger in HOST_EVICTION_TRIGGERS:
+                    for disposition in HOST_EVICTION_DISPOSITIONS:
+                        gauge.labels(
+                            **self.labels, trigger=trigger, disposition=disposition
+                        ).set(values.get(trigger, {}).get(disposition, 0))
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -1908,8 +1955,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
-            documentation="Storage-hit tokens that did not become a usable "
-            "prefetch result, by terminal reason.",
+            documentation="Storage-hit tokens that did not become a usable prefetch result, by terminal reason.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (

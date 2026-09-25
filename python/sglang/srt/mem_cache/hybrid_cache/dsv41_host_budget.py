@@ -6,6 +6,7 @@ Other model/layout combinations fail closed instead of silently undercounting.
 """
 
 import math
+from fractions import Fraction
 
 
 METADATA_RESERVE_BYTES = 1024**3  # host-wide allowance; not a process RSS limit
@@ -77,7 +78,14 @@ def plan_pages(
     swa_page_bytes,
     full_metadata_page_bytes=0,
     swa_metadata_page_bytes=0,
+    swa_fraction=None,
 ):
+    """Size both pools, optionally fixing SWA's fraction of tensor payload.
+
+    Metadata stays inside budget_bytes, but outside the payload split. Unset
+    preserves device-proportional sizing. Rational arithmetic keeps whole-page
+    rounding deterministic across ranks and avoids float budget overshoots.
+    """
     values = (budget_bytes, ranks, full_pages, swa_pages, full_page_bytes, swa_page_bytes)
     if any(type(value) is not int or value <= 0 for value in values):
         raise ValueError("HiCache sizing requires positive integer inputs")
@@ -85,17 +93,36 @@ def plan_pages(
         raise ValueError("Bounded V4.1 HiCache is qualified only for four local ranks")
     if any(type(v) is not int or v < 0 for v in (full_metadata_page_bytes, swa_metadata_page_bytes)):
         raise ValueError("Invalid metadata allowance")
+    fraction = None
+    if swa_fraction is not None:
+        try:
+            fraction = Fraction(str(swa_fraction))
+        except (ValueError, ZeroDivisionError) as exc:
+            raise ValueError("SWA payload fraction must be strictly between 0 and 1") from exc
+        if not 0 < fraction < 1:
+            raise ValueError("SWA payload fraction must be strictly between 0 and 1")
     per_rank = (budget_bytes - METADATA_RESERVE_BYTES) // ranks
 
     def usage(pages):
-        swa = pages * swa_pages // full_pages
+        if fraction is None:
+            swa = pages * swa_pages // full_pages
+        else:
+            swa = (
+                pages * full_page_bytes * fraction.numerator
+                // (swa_page_bytes * (fraction.denominator - fraction.numerator))
+            )
         return (
             pages * (full_page_bytes + full_metadata_page_bytes) + swa * (swa_page_bytes + swa_metadata_page_bytes)
         ), swa
 
-    if usage(full_pages)[0] > per_rank:
+    minimum_full_pages = full_pages
+    if fraction is not None:
+        numerator = swa_pages * swa_page_bytes * (fraction.denominator - fraction.numerator)
+        denominator = full_page_bytes * fraction.numerator
+        minimum_full_pages = max(full_pages, (numerator + denominator - 1) // denominator)
+    if usage(minimum_full_pages)[0] > per_rank:
         raise ValueError("HiCache budget cannot hold one device-cache equivalent")
-    lo, hi = full_pages, per_rank // full_page_bytes + 1
+    lo, hi = minimum_full_pages, per_rank // full_page_bytes + 1
     while lo + 1 < hi:
         mid = (lo + hi) // 2
         if usage(mid)[0] <= per_rank:
@@ -118,4 +145,9 @@ def plan_pages(
         "tensor_bytes_host_total": tensor_bytes * ranks,
         "planned_bytes_host_total": planned_bytes * ranks + METADATA_RESERVE_BYTES,
         "slot_metadata_bytes_per_rank": planned_bytes - tensor_bytes,
+        "allocation_mode": "device_ratio" if fraction is None else "payload_fraction",
+        "requested_swa_payload_fraction": None if fraction is None else float(fraction),
+        "actual_swa_payload_fraction": swa * swa_page_bytes / tensor_bytes,
+        "full_tensor_bytes_per_rank": lo * full_page_bytes,
+        "swa_tensor_bytes_per_rank": swa * swa_page_bytes,
     }

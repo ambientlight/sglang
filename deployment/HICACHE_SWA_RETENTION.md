@@ -110,8 +110,8 @@ derives page costs from actual tensor shapes, including:
   of slot indices while merging frees.
 - A further host-wide 1 GiB metadata allowance.
 
-For candidate FULL host page count `F`, the SWA count is proportional to the
-GPU pool split:
+By default, for candidate FULL host page count `F`, the SWA count is
+proportional to the GPU pool split:
 
 ```text
 S = floor(F * device_swa_pages / device_full_pages)
@@ -127,6 +127,47 @@ the pools, it also checks actual initial KV buffers and free-slot arrays
 against the host-wide budget. This is a bounded allocation plan, not an OS RSS
 limit; Python objects, temporary allocations, and other processes still need
 headroom.
+
+### Explicit RAM-only payload split (September 18 follow-up)
+
+`DSV41_HICACHE_SWA_FRACTION=0.236` selects **23.6% SWA / 76.4% FULL** of
+the tensor payload. The 256,000,000,000-byte host budget still includes the
+slot-array allowances and fixed 1 GiB reserve. This is not 23.6% of token
+slots, does not change GPU pool sizes, and is not a limit of five boundaries
+per conversation. With the variable absent, the historical GPU-proportional
+path above is preserved. Invalid fractions or a fraction without a nonzero
+host budget fail closed.
+
+For rational fraction `q`, the sizing rule becomes:
+
+```text
+S = floor(F * full_page_bytes * q / (swa_page_bytes * (1 - q)))
+```
+
+The same byte-budget inequality above includes all metadata. The search also
+requires `F >= device_full_pages` and `S >= device_swa_pages`; an incompatible
+budget/fraction is rejected rather than silently changing the requested split.
+Whole-page rounding makes the measured SWA share slightly lower than requested.
+Startup `DSV41_HICACHE_BUDGET` records include allocation mode, requested and
+actual payload fractions, and each pool's payload bytes.
+
+At the current measured page costs (417,920 FULL / 6,439,680 SWA bytes per
+rank/page, plus 30,720 / 6,144 metadata-allowance bytes), the projected plan is:
+
+| Quantity | Explicit 23.6% plan |
+|---|---:|
+| FULL host capacity | 28,234,496 logical tokens |
+| SWA host capacity | 565,760 slots/rank |
+| FULL payload, all four ranks | 184,371,258,880 bytes |
+| SWA payload, all four ranks | 56,926,771,200 bytes |
+| Actual SWA payload share | 23.5919% |
+| Total plan including allowances | 255,978,642,944 bytes |
+
+This plan is independent of changes in the automatic GPU FULL/SWA ratio while
+the host tensor layout stays the same and both minimum capacities fit. The
+23.6% target is a workload-tuning experiment, not proof that boundary eviction
+is eliminated. Monitor boundary evictions and real host restores. No automatic
+RAM borrowing between pools or per-conversation checkpoint cap is introduced.
 
 The qualified layout is single-node TP4/PP1, non-unified V4.1 C1/C2 pools with
 packed DSPARK draft pools. Unsupported layouts, missing draft state, misaligned

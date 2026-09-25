@@ -1,7 +1,8 @@
 """Pinned 0xSero boot with deployment identity, auth, sampling and scheduler controls.
 
 Source: 45f538a18569420721e00e37353f9a7e1af7e5da/boot.py.
-Hardware, checkpoint verification, startup and baseline smoke logic are unchanged.
+Hardware, checkpoint verification and baseline smoke logic are unchanged.
+Subprocess logs are forwarded as bounded binary chunks with supervised failure.
 """
 import concurrent.futures
 import base64
@@ -157,7 +158,152 @@ def hicache_host_budget():
         raise ValueError('DSV41_HICACHE_HOST_BUDGET_BYTES must be an integer') from exc
     if not 0 <= hicache_budget <= 256_000_000_000:
         raise ValueError('DSV41_HICACHE_HOST_BUDGET_BYTES must be 0 through 256000000000 (host total)')
+    fraction = os.environ.get('DSV41_HICACHE_SWA_FRACTION')
+    if fraction is not None:
+        try:
+            valid = 0 < float(fraction) < 1
+        except ValueError:
+            valid = False
+        if not valid or not hicache_budget:
+            raise ValueError('DSV41_HICACHE_SWA_FRACTION requires a nonzero host budget and a fraction strictly between 0 and 1')
     return hicache_budget
+
+
+def _write_log_bytes(output, data):
+    """Binary sinks may accept partial writes; never silently drop the remainder."""
+    remaining = memoryview(data)
+    while remaining:
+        written = output.write(remaining)
+        if written is None or written <= 0:
+            raise OSError('Log sink stopped accepting bytes')
+        remaining = remaining[written:]
+    if data:
+        output.flush()
+
+
+def forward_log_bytes(source, output, secret, chunk_size=65536):
+    """Drain raw bytes, preserving Unicode and redacting keys across read boundaries.
+
+    A shared, multi-process stdout stream need not be valid UTF-8 even when its
+    individual writers are. Never decode it in the only pipe reader. Retain only
+    a possible secret prefix, not an entire (potentially multi-MB) log line.
+    Popen uses bufsize=0 so read() forwards available bytes without waiting for
+    a full chunk or newline. Docker remains responsible for log framing.
+    """
+    secret = secret.encode('utf-8')
+    pending = b''
+    while True:
+        block = source.read(chunk_size)
+        if not block:
+            _write_log_bytes(output, pending)
+            return
+        data = pending + block
+        if not secret:
+            _write_log_bytes(output, data)
+            continue
+        pieces, position = [], 0
+        while True:
+            found = data.find(secret, position)
+            if found < 0:
+                break
+            pieces.extend((data[position:found], b'[REDACTED]'))
+            position = found + len(secret)
+        remainder = data[position:]
+        keep = min(len(secret) - 1, len(remainder))
+        while keep and not remainder.endswith(secret[:keep]):
+            keep -= 1
+        pieces.append(remainder[:-keep] if keep else remainder)
+        pending = remainder[-keep:] if keep else b''
+        _write_log_bytes(output, b''.join(pieces))
+
+
+class ServerLogForwarder:
+    """A dead reader must terminate the server, never strand a live unread pipe."""
+
+    def __init__(self, process, secret, output=None, shutdown_timeout=10, kill_timeout=5):
+        self.process = process
+        self.secret = secret
+        self.output = sys.stdout.buffer if output is None else output
+        self.shutdown_timeout = shutdown_timeout
+        self.kill_timeout = kill_timeout
+        self.failed = threading.Event()
+        self.failure_kind = None
+        self.stop_requested = False
+        self._stop_lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, name='dsv41-log-forwarder', daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _signal(self, signum):
+        try:
+            os.killpg(self.process.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    def request_stop(self, *_):
+        # Signal handlers must not wait on the reader or acquire its stop lock.
+        self.stop_requested = True
+        if self.process.poll() is None:
+            self._signal(signal.SIGTERM)
+
+    def stop(self):
+        with self._stop_lock:
+            if self.process.poll() is not None:
+                return
+            self._signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=self.shutdown_timeout)
+            except subprocess.TimeoutExpired:
+                self._signal(signal.SIGKILL)
+                try:
+                    self.process.wait(timeout=self.kill_timeout)
+                except subprocess.TimeoutExpired:
+                    # TimeoutExpired includes process.args, which may have a key.
+                    raise RuntimeError('Server did not exit after bounded SIGKILL wait') from None
+
+    def _run(self):
+        try:
+            forward_log_bytes(self.process.stdout, self.output, self.secret)
+            # EOF just before normal process exit is fine. EOF while the server
+            # remains alive is a broken logging path and must fail closed.
+            self.process.wait(timeout=1)
+        except BaseException as exc:
+            # Do not retain/print exception text: it can contain captured secrets.
+            self.failure_kind = type(exc).__name__
+            self.failed.set()
+            try:
+                self.process.stdout.close()
+            except BaseException:
+                pass
+            # Also covers failures during startup/smoke while the main thread
+            # is inside an HTTP call. Never expose the original log exception
+            # through threading.excepthook if cleanup itself fails.
+            try:
+                self.stop()
+            except BaseException:
+                pass  # The main thread independently checks failure and stops.
+
+    def check(self):
+        if self.failed.is_set():
+            raise RuntimeError(f'Server log forwarding failed ({self.failure_kind}); refusing an unread live pipe')
+
+    def wait(self):
+        while True:
+            self.check()
+            if self.stop_requested:
+                self.stop()
+            try:
+                result = self.process.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        self.thread.join(timeout=5)
+        self.check()
+        if self.thread.is_alive():
+            raise RuntimeError('Server exited but log forwarding did not finish within 5 seconds')
+        return result
+
 
 def serve():
     hicache_budget = hicache_host_budget()
@@ -214,39 +360,41 @@ def serve():
     authenticated = require_api_key()
     save('launch.json',{'revision':REVISION,'offload_mode':mode,'args':args,'gpus':gpu,
                         'require_api_key':authenticated,'served_model_name':served_model_name(),
-                        'hicache_host_budget_bytes':hicache_budget})
+                        'hicache_host_budget_bytes':hicache_budget,
+                        'hicache_swa_payload_fraction':os.environ.get('DSV41_HICACHE_SWA_FRACTION')})
     secret = key()
     env = dict(os.environ,DSV41_SOURCE=str(MODEL))
     command = [sys.executable,'-m','sglang.launch_server',*args]
     if authenticated:
         command.extend(['--api-key',secret])
     process = subprocess.Popen(command,
-        env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)
-    def stop(*_):
-        if process.poll() is None:
-            os.killpg(process.pid,signal.SIGTERM)
-    signal.signal(signal.SIGTERM,stop)
-    signal.signal(signal.SIGINT,stop)
-    def logs():
-        for line in process.stdout:
-            print(line.replace(secret,'[REDACTED]'),end='',flush=True)
-    threading.Thread(target=logs,daemon=True).start()
+        env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,bufsize=0,start_new_session=True)
+    forwarder = ServerLogForwarder(process, secret)
+    signal.signal(signal.SIGTERM,forwarder.request_stop)
+    signal.signal(signal.SIGINT,forwarder.request_stop)
+    forwarder.start()
     try:
         deadline = time.monotonic()+1800
         while process.poll() is None and time.monotonic()<deadline:
+            forwarder.check()
+            if forwarder.stop_requested:
+                raise RuntimeError('Server startup interrupted')
             try:
                 request('/health',timeout=3)
                 break
             except Exception:
                 time.sleep(5)
         else:
+            forwarder.check()
             raise RuntimeError('Server failed to become healthy; inspect container logs')
         smoke()
+        forwarder.check()
         auth_description = 'API key required' if authenticated else 'no backend API key (legacy compatibility)'
         print(f'Ready: {served_model_name()} on port {PORT}; {auth_description}.',flush=True)
-        return process.wait()
+        return forwarder.wait()
     finally:
-        stop()
+        forwarder.stop()
+        forwarder.thread.join(timeout=1)
 
 if __name__ == '__main__':
     command = sys.argv[1] if len(sys.argv)>1 else 'run'
