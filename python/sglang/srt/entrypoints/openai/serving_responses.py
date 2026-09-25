@@ -1184,6 +1184,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
+                finish_reason=(meta_info or {}).get("finish_reason"),
             )
 
             if meta_info is not None:
@@ -1315,6 +1316,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         output_logprobs: Optional[list] = None,
         *,
         require_reasoning: bool,
+        finish_reason: Optional[dict[str, Any]] = None,
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
         if self.reasoning_parser:
@@ -1451,6 +1453,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 status="completed",
                 type="message",
+                **(
+                    {
+                        "phase": (
+                            "final_answer"
+                            if not tool_call_items
+                            and (finish_reason or {}).get("type") == "stop"
+                            else "commentary"
+                        )
+                    }
+                    if self.chat_encoding_spec == "dsv41"
+                    else {}
+                ),
             )
             output_items.append(message)
         output_items.extend(tool_call_items)
@@ -2707,7 +2721,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(*, phase="commentary"):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -2720,6 +2734,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
+                **({"phase": phase} if self.chat_encoding_spec == "dsv41" else {}),
             )
             events = [
                 _queue_event(
@@ -2881,6 +2896,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                             role="assistant",
                             content=[],
                             status="in_progress",
+                            # V4.1 has no native phase token. Keep the turn working
+                            # while streaming; completion resolves whether this
+                            # message precedes tools or is the terminal answer.
+                            **(
+                                {"phase": "commentary"}
+                                if self.chat_encoding_spec == "dsv41"
+                                else {}
+                            ),
                         ),
                     )
                 )
@@ -3217,7 +3240,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         for ev in _close_reasoning_item():
             if ev is not None:
                 yield ev
-        for ev in _close_message_item():
+        for ev in _close_message_item(
+            phase=(
+                "final_answer"
+                if not tool_call_states
+                and (finish_reason or {}).get("type") == "stop"
+                else "commentary"
+            )
+        ):
             if ev is not None:
                 yield ev
         for tool_index in list(tool_call_states):
