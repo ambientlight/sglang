@@ -144,6 +144,8 @@ try:
 except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
+from sglang.srt import pearl_runtime as pearl
+
 logger = logging.getLogger(__name__)
 
 
@@ -2178,6 +2180,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if pearl.OBSERVE:
+                pearl.before_replay(self, forward_batch)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

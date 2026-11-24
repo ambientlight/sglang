@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
 import torch
+from sglang.srt import pearl_runtime as pearl
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -1768,6 +1769,7 @@ class RowParallelLinear(LinearBase):
         skip_all_reduce=False,
         forward_batch=None,
         output_tensor=None,
+        pearl_batch=None,
     ):
         tp_rank, tp_size = get_group_rank_size(self.tp_group)
         if self.input_is_parallel:
@@ -1806,7 +1808,9 @@ class RowParallelLinear(LinearBase):
                 disabled=self.tp_group is None or not is_allocation_symmetric(),
             )
         with symm_ctx:
-            if output_tensor is None:
+            if pearl_batch is not None and output_tensor is None:
+                output_parallel = pearl.project(self, input_parallel, bias_, pearl_batch)
+            elif output_tensor is None:
                 output_parallel = self.quant_method.apply(
                     self, input_parallel, bias=bias_
                 )

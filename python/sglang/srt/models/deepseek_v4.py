@@ -290,6 +290,8 @@ def get_mhc_ops() -> MhcOps:
     )
 
 
+from sglang.srt import pearl_runtime as pearl
+
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -2911,7 +2913,7 @@ class MQALayer(MqaAttentionBase):
             o = self._forward_mega(
                 q, kernel_num_heads, attn_sink, forward_batch, attn_backend
             )
-            return self._project_wo_b(o, defer_all_reduce)
+            return self._project_wo_b(o, defer_all_reduce, forward_batch)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -3009,7 +3011,7 @@ class MQALayer(MqaAttentionBase):
             inv_rope=inv_rope,
             wo_a_quant_freqs=wo_a_quant_freqs,
         )
-        return self._project_wo_b(o, defer_all_reduce)
+        return self._project_wo_b(o, defer_all_reduce, forward_batch)
 
     def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
         if wo_a_quant_freqs is not None:
@@ -3042,7 +3044,9 @@ class MQALayer(MqaAttentionBase):
             )
         else:
             fuse_mxfp8_quant = (
-                self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
+                self.use_flashinfer_mxfp8_wo_b
+                and not get_forward().sp_active
+                and not (pearl.OPERATOR is not None and getattr(self, "pearl_target_layer", False))
             )
             fuse_rope_wo_a = (
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
@@ -3186,7 +3190,7 @@ class MQALayer(MqaAttentionBase):
 
         return o
 
-    def _project_wo_b(self, o, defer_all_reduce: bool = False):
+    def _project_wo_b(self, o, defer_all_reduce: bool = False, forward_batch=None):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 
         defer_all_reduce = defer_all_reduce and (
@@ -3204,6 +3208,7 @@ class MQALayer(MqaAttentionBase):
         o, _ = self.wo_b(
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
+            pearl_batch=forward_batch if pearl.OBSERVE and getattr(self, "pearl_target_layer", False) else None,
         )
         if defer_all_reduce:
             return mhc.AttnOutput(o)
@@ -3265,6 +3270,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        self.self_attn.pearl_target_layer = layer_id == 0 and not is_nextn
         moe_alt_stream = (
             alt_streams[0]
             if (

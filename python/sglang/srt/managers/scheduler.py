@@ -451,6 +451,8 @@ else:
         pass
 
 
+from sglang.srt import pearl_runtime as pearl
+
 logger = logging.getLogger(__name__)
 
 # Cap on rids printed per --log-schedule-decisions line.
@@ -2398,6 +2400,8 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            if pearl.SOCKET or pearl.OBSERVE:
+                pearl.scheduler_rank(get_parallel().tp_rank).receive(self._tokenized_requests(recv_req))
             # Before any early exit, so every request releases its CUDA IPC pool slot.
             for tokenized_req in self._tokenized_requests(recv_req):
                 if tokenized_req.positional_embed_overrides is not None:
@@ -6181,6 +6185,11 @@ class Scheduler(
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
+
+        if pearl.SOCKET or pearl.OBSERVE:
+            pearl.scheduler_rank(get_parallel().tp_rank).idle(
+                lambda: torch.cuda.synchronize(get_device().gpu_id)
+            )
 
         if self.deferred_responses.has_pending():
             # Held responses are released by polling, not by a socket event:

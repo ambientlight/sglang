@@ -240,6 +240,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
+from sglang.srt import pearl_runtime as pearl
+
 logger = logging.getLogger(__name__)
 
 
@@ -679,6 +681,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Parse args
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
+        pearl.validate_config()
         self.startup_time: Optional[Dict[str, Any]] = None
         parallel = get_parallel()
         self.elastic_worker_count = parallel.num_dp_ranks
@@ -1100,7 +1103,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         for state in request_states.values():
             state.waiting_at_pause_gate = True
+        pearl_admission = pearl.Admission(pearl.SOCKET) if pearl.SOCKET else None
         try:
+            if pearl_admission is not None:
+                await pearl_admission.start()
+                mossvl = self.mm_processor is not None and (
+                    "MossVLForConditionalGeneration" in self.model_config.hf_config.architectures
+                )
+                if obj.contains_mm_input() or mossvl or obj.lora_path or get_disagg().language_only:
+                    await pearl_admission.wait()
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -1121,7 +1132,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    await self._send_one_request(tokenized_obj)
+                    await self._send_one_request(tokenized_obj, pearl_admission)
+                    if pearl_admission is not None:
+                        await pearl_admission.close()
                     if obj.input_ids is not None and not self._reads_input_ids_late():
                         obj.input_ids = None
                         state.prompt_released = True
@@ -1129,7 +1142,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield response
                 else:
                     async for response in self._handle_batch_request(
-                        obj, request, request_states
+                        obj, request, request_states, pearl_admission
                     ):
                         yield response
         except BaseException:
@@ -1142,6 +1155,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # cleanup.
             self._release_req_states_on_failure(request_states)
             raise
+        finally:
+            if pearl_admission is not None:
+                await pearl_admission.close()
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -2081,6 +2097,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        pearl_admission=None,
     ):
         prepared_mm_items = []
         prepared_embeds = []
@@ -2105,7 +2122,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
-            self._dispatch_to_scheduler(tokenized_obj)
+            if pearl_admission is None:
+                self._dispatch_to_scheduler(tokenized_obj)
+            else:
+                await pearl_admission.dispatch(self._dispatch_to_scheduler, tokenized_obj, [tokenized_obj])
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
             dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
@@ -2197,6 +2217,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_objs: List[
             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
         ],
+        pearl_admission=None,
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
         prepared_mm_items = []
@@ -2230,7 +2251,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-            self._dispatch_to_scheduler(batch_req)
+            if pearl_admission is None:
+                self._dispatch_to_scheduler(batch_req)
+            else:
+                await pearl_admission.dispatch(self._dispatch_to_scheduler, batch_req, tokenized_objs)
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
@@ -2478,6 +2502,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request],
         request_states: Dict[str, ReqState],
+        pearl_admission=None,
     ):
         batch_size = obj.batch_size
 
@@ -2486,7 +2511,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                await self._send_batch_request(tokenized_objs)
+                await self._send_batch_request(tokenized_objs, pearl_admission)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
@@ -2511,7 +2536,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        await self._send_one_request(tokenized_obj)
+                        await self._send_one_request(tokenized_obj, pearl_admission)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -2549,7 +2574,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
-                await self._send_one_request(tokenized_obj)
+                await self._send_one_request(tokenized_obj, pearl_admission)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Retain initial states until all warmups succeed so errors can
@@ -2583,12 +2608,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    await self._send_one_request(tokenized_obj)
+                    await self._send_one_request(tokenized_obj, pearl_admission)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
                 if objs[i].rid in initial_req_states:
                     initial_req_states[objs[i].rid].time_stats.set_finished_time()
+
+        if pearl_admission is not None:
+            await pearl_admission.close()
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
