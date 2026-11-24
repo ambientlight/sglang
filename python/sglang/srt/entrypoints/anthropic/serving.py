@@ -35,6 +35,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError as JSONSchemaError
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, ValidationError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -258,7 +260,9 @@ def _validate_anthropic_tool_input(
         raise MalformedToolCallError("Model attempted to call an undeclared tool")
 
     try:
-        Draft202012Validator(declaration.input_schema).validate(tool_input)
+        Draft202012Validator(declaration.input_schema, registry=Registry()).validate(
+            tool_input
+        )
     except JSONSchemaValidationError as e:
         if enforce_schema or declaration.strict is True:
             raise MalformedToolCallError(
@@ -269,7 +273,7 @@ def _validate_anthropic_tool_input(
             "the client may return an is_error tool_result",
             name,
         )
-    except (JSONSchemaError, RecursionError) as e:
+    except (JSONSchemaError, Unresolvable, RecursionError) as e:
         # Request validation normally catches this before generation. Keep the
         # publication boundary safe when called directly or by a custom route.
         raise MalformedToolCallError("Declared tool schema is invalid") from e

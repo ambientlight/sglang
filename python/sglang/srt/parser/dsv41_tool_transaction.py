@@ -3,7 +3,9 @@
 import json
 
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError
+from jsonschema.exceptions import SchemaError, ValidationError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from sglang.srt.function_call.core_types import MalformedToolCallError
 from sglang.srt.parser.deepseek_recipe_output import RecipeOutputDelta, whole_tool_calls
@@ -86,8 +88,12 @@ def validate_call(tools, name, arguments):
         raise MalformedToolCallError("Model emitted non-object tool-call arguments")
     if tool.strict:
         try:
-            Draft202012Validator(tool.parameters or {}).validate(arguments)
+            Draft202012Validator(tool.parameters or {}, registry=Registry()).validate(
+                arguments
+            )
         except ValidationError as exc:
             raise MalformedToolCallError(
                 "Model emitted tool-call arguments that do not match the declared schema"
             ) from exc
+        except (SchemaError, Unresolvable, RecursionError) as exc:
+            raise MalformedToolCallError("Declared tool schema is invalid") from exc

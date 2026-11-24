@@ -80,6 +80,45 @@ class LocalDeepSeekTest(unittest.TestCase):
                 with self.assertRaises(MalformedToolCallError):
                     parser.finish([], {"type": "stop"})
 
+    def test_local_schema_references_for_both_tool_apis(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import (
+            _validate_anthropic_tool_input,
+        )
+        from sglang.srt.parser.dsv41_tool_transaction import validate_call
+
+        def check(ref):
+            schema = {
+                "type": "object",
+                "properties": {"q": {"$ref": ref}},
+                "$defs": {"query": {"type": "string"}},
+            }
+            return (
+                lambda: validate_call(
+                    {"lookup": SimpleNamespace(strict=True, parameters=schema)},
+                    "lookup",
+                    '{"q":"value"}',
+                ),
+                lambda: _validate_anthropic_tool_input(
+                    AnthropicMessagesRequest(
+                        model="model",
+                        max_tokens=8,
+                        messages=[{"role": "user", "content": "query"}],
+                        tools=[
+                            {"name": "lookup", "input_schema": schema, "strict": True}
+                        ],
+                    ),
+                    "lookup",
+                    {"q": "value"},
+                ),
+            )
+
+        for validate in check("#/$defs/query"):
+            validate()
+        for validate in check("urn:fixture:unregistered-schema"):
+            with self.assertRaisesRegex(MalformedToolCallError, "schema is invalid"):
+                validate()
+
     def test_error_result_rendering_and_retrocompatible_prompt_ids(self):
         def render(error):
             request = self.original.model_copy(

@@ -46,7 +46,7 @@ dependencies = [
   "grpcio-reflection>=1.81.1",
   "humming-kernels[cu13]==0.1.18",
   "interegular",
-  "jsonschema>=4",
+  "jsonschema>=4.18",
   "IPython",
   "kernels>=0.14.1,<0.15",
   "llguidance>=1.7.6,<2.0.0",

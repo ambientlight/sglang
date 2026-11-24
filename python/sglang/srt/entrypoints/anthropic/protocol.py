@@ -264,8 +264,7 @@ class AnthropicThinkingParam(BaseModel):
     union of three variants — see ``anthropic-sdk-python``'s
     ``thinking_config_{enabled,disabled,adaptive}_param.py``:
 
-    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
-      ``display``.
+    * ``enabled`` accepts ``budget_tokens`` (≥1024 when supplied) and ``display``.
     * ``disabled`` accepts no other fields.
     * ``adaptive`` (Claude 4.7) accepts ``display`` but not
       ``budget_tokens``.
