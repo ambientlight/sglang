@@ -157,6 +157,16 @@ class Rank:
         if NATIVE_IDLE_CONFIG:
             from sglang.srt.pearl_native_idle import NativeIdle
             self.native_idle = NativeIdle(index, NATIVE_IDLE_CONFIG)
+            # The serving processes are non-dumpable. Report only Pearl library
+            # basenames and effective flags from this process once at startup.
+            with open("/proc/self/maps") as maps:
+                libraries = sorted({Path(line.split()[-1]).name for line in maps if "/libpearl_" in line})
+            receipt = self.native_idle.log_path.with_suffix(".startup.json")
+            tmp = receipt.with_suffix(".tmp")
+            tmp.write_text(json.dumps(dict(pid=os.getpid(), rank=index, observe=OBSERVE,
+                graph_verify=GRAPH_VERIFY, operator=getattr(OPERATOR, "__name__", None),
+                pearl_libraries=libraries)) + "\n")
+            tmp.replace(receipt)
 
     def _command(self, line):
         if not self.path:

@@ -20,7 +20,8 @@ class NativeIdle:
             config = json.load(source)
         self.library = ctypes.CDLL(config.pop("library"))
         config["worker"] = f"{config.pop('worker_prefix')}{rank}"
-        config["log"] = str(Path(config.pop("log_dir")) / f"native-{rank}-{os.getpid()}.jsonl")
+        self.log_path = Path(config.pop("log_dir")) / f"native-{rank}-{os.getpid()}.jsonl"
+        config["log"] = str(self.log_path)
         self.library.pearl_idle_start.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
         self.library.pearl_idle_start.restype = ctypes.c_void_p
         self.library.pearl_idle_stop.argtypes = [ctypes.c_void_p]
