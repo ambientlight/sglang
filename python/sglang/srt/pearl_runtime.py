@@ -199,14 +199,16 @@ def scheduler_rank(index):
 
 def real_rows(batch):
     # DP attention padding can replace the visible forward mode and batch size.
-    if getattr(batch, "_original_forward_mode", None) is not None:
+    # Under sequence sharding the CPU count is global. Reading the local device
+    # scalar here would synchronize inference just to decide whether to mine.
+    if batch.attn_tp_sequence_sharded or getattr(batch, "_original_forward_mode", None) is not None:
         return None
     mode = batch.forward_mode.name
     if mode not in ("EXTEND", "DECODE", "TARGET_VERIFY"):
         return None
     if mode == "EXTEND":
         count = batch.extend_num_tokens
-        unpadded = getattr(batch, "num_token_non_padded_cpu", None)
+        unpadded = batch.global_num_token_non_padded_cpu
         return min(count, unpadded) if count is not None and unpadded is not None else count
     original = getattr(batch, "_original_batch_size", None)
     batch_size = batch.batch_size if original is None else original

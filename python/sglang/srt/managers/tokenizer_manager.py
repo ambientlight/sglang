@@ -28,7 +28,6 @@ import socket
 import sys
 import threading
 import time
-import traceback
 from array import array
 from collections import deque
 from contextlib import nullcontext
