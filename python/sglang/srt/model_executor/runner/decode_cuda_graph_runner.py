@@ -1605,6 +1605,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                if pearl.GRAPH_VERIFY and not self.model_runner.is_draft_worker:
+                    if getattr(forward_batch, "pearl_captured_projection_count", 0) != 1:
+                        raise RuntimeError(f"Expected one live Pearl projection in the captured target graph {shape_key}")
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
