@@ -1482,6 +1482,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs, num_tokens=num_tokens
         )
 
+        if pearl.GRAPH_VERIFY:
+            pearl.prepare_graph_capture(self, forward_batch)
+
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
@@ -2180,9 +2183,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            if pearl.OBSERVE:
-                pearl.before_replay(self, forward_batch)
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            pearl_state = pearl.before_replay(self, forward_batch) if pearl.OBSERVE else None
+            if pearl_state is None:
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
+            else:
+                try:
+                    output = self.backend.replay(self._replay_graph_key, forward_batch)
+                except BaseException:
+                    pearl.OPERATOR.end_graph(pearl_state, False)
+                    raise
+                pearl.OPERATOR.end_graph(pearl_state, True)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

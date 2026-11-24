@@ -6,25 +6,42 @@ import json
 import os
 from pathlib import Path
 import socket
+import time
 import uuid
 
 SOCKET = os.environ.get("PEARL_BROKER_SOCKET")
 SHAPE_DIR = os.environ.get("PEARL_SHAPE_DIR")
 _OPERATOR_MODULE = os.environ.get("PEARL_WOB_MODULE")
 OPERATOR = importlib.import_module(_OPERATOR_MODULE) if _OPERATOR_MODULE else None
-OBSERVE = bool(SHAPE_DIR or OPERATOR)
+GRAPH_VERIFY = os.environ.get("PEARL_GRAPH_VERIFY") == "1"
+OBSERVE = bool(SHAPE_DIR or OPERATOR or GRAPH_VERIFY)
 TIMEOUT = 6.0  # broker's default worker-drain deadline is five seconds
 _rank = None
 
 
 def validate_config():
-    if not SOCKET and OPERATOR is None:
+    if not SOCKET and OPERATOR is None and not GRAPH_VERIFY:
         return
     from sglang.srt.runtime_context import get_flags, get_parallel
-    from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend, Phase, check_cuda_graph_backend, cuda_graph_fully_disabled,
+    )
     parallel = get_parallel()
     if SOCKET and (parallel.num_dp_ranks != 1 or parallel.pp_size != 1):
         raise ValueError("Pearl broker handoff requires one host-local TP group (DP1, PP1)")
+    if GRAPH_VERIFY:
+        if (not SOCKET or OPERATOR is None
+                or not all(hasattr(OPERATOR, method) for method in
+                           ("capture_project", "begin_graph", "end_graph", "counters"))
+                or os.environ.get("PEARL_PUBLIC_REPLAY") != "1"
+                or os.environ.get("PEARL_GPU_PREPARE") != "1"
+                or not os.environ.get("PEARL_REPLAY_POOL_PORT")):
+            raise ValueError("Pearl target graph requires rank admission, a public replay job peer, and GPU preparation")
+        if (parallel.tp_size != 4 or get_flags().capture.enable_torch_compile
+                or not check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+                or not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)):
+            raise ValueError("Pearl target graph requires TP4, full decode graphs, eager prefill, and disabled torch.compile")
+        return
     if OPERATOR is not None and (
         not cuda_graph_fully_disabled() or get_flags().capture.enable_torch_compile
     ):
@@ -125,6 +142,8 @@ class Rank:
         self.path = path
         self.shape_dir = Path(shape_dir) if shape_dir else None
         self.counts = Counter()
+        self.next_receipt = 0.0
+        self.last_counters = None
         self.stream = None
         self.active = None
 
@@ -170,8 +189,26 @@ class Rank:
                     raise RuntimeError("tokenized request reached scheduler without a Pearl admission")
                 self._command(f"TAKE {child} {self.index}")
 
+    def _write_graph_counters(self, force=False):
+        now = time.monotonic()
+        if not force and now < self.next_receipt:
+            return
+        self.next_receipt = now + 0.1
+        body = json.dumps(OPERATOR.counters(), sort_keys=True, separators=(",", ":")) + "\n"
+        if body == self.last_counters:
+            return
+        out = self.shape_dir / f"pearl-counters-{os.getpid()}-tp{self.index}.json"
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(body)
+        os.replace(tmp, out)
+        self.last_counters = body
+
     def idle(self, synchronize):
         if self.active is False:
+            # A proof or peer response can finish after the final rank fence. Refresh
+            # changed receipts on idle polls without delaying handoff for their completion.
+            if GRAPH_VERIFY and self.shape_dir and self.counts:
+                self._write_graph_counters()
             return
         if self.path:
             # The forward, sampler, transfers and NCCL may use different streams.
@@ -186,6 +223,8 @@ class Rank:
                     for (mode, path, real, executed), n in self.counts.items()]
             tmp.write_text(json.dumps(rows, separators=(",", ":")) + "\n")
             os.replace(tmp, out)
+            if GRAPH_VERIFY:
+                self._write_graph_counters(force=True)
 
 
 def scheduler_rank(index):
@@ -237,8 +276,9 @@ def _capturing():
 
 
 def project(layer, x, bias, batch):
-    # Called only for layer 0's wo_b. Keep warmup and graph capture on the
-    # unchanged kernel; public replay candidates must be eager and unpadded.
+    # Only the full target graph carries this marker, including its two warmup forwards.
+    if GRAPH_VERIFY and getattr(batch, "pearl_graph_verify_capture", False):
+        return OPERATOR.capture_project(layer, x, bias, batch)
     if _rank is not None and _rank.active and not _capturing():
         rows = real_rows(batch)
         executed = (x[0] if isinstance(x, tuple) else x).shape[0]
@@ -248,13 +288,34 @@ def project(layer, x, bias, batch):
     return layer.quant_method.apply(layer, x, bias=bias)
 
 
-def before_replay(runner, batch):
-    # Python in a captured forward does not execute at replay. Count the real
-    # incoming target batch on the host, independently of graph padding.
-    if runner.model_runner.is_draft_worker or _rank is None or not _rank.active:
+def prepare_graph_capture(runner, batch):
+    if runner.model_runner.is_draft_worker:
         return
-    if OPERATOR is not None:
-        raise RuntimeError("Pearl public projection requires eager execution for both phases")
+    if (not runner.model_runner.spec_algorithm.is_dspark() or runner.ragged_verify_mode
+            or not batch.forward_mode.is_target_verify() or runner.captured_req_width != 6
+            or batch.batch_size not in range(1, 9)):
+        raise ValueError("Pearl public target capture requires 1–8 fixed six-row DSPARK verify slots")
+    batch.pearl_graph_verify_capture = True
+
+
+def before_replay(runner, batch):
+    # Real CPU batch metadata is available here even when the captured forward pads it.
+    if runner.model_runner.is_draft_worker:
+        return
+    active = _rank is not None and _rank.active
+    if not active and not GRAPH_VERIFY:
+        return
     rows = real_rows(batch)
     executed = runner._replay_graph_key.size if runner.ragged_verify_mode else runner.bs * runner.captured_req_width
     _record(batch, "target_graph", rows, executed)
+    if GRAPH_VERIFY:
+        eligible = bool(active and batch.forward_mode.is_target_verify() and rows == executed
+                        and not runner.ragged_verify_mode and runner.raw_bs == runner.bs
+                        and runner.raw_num_token == executed and batch.global_num_token_non_padded_cpu == executed
+                        and batch.ragged_verify_layout is None
+                        and getattr(batch.spec_info, "ragged_verify_layout", None) is None)
+        path, state = OPERATOR.begin_graph(runner.model_runner.gpu_id, rows, executed, eligible)
+        _record(batch, path, rows, executed)
+        return state
+    if OPERATOR is not None:
+        raise RuntimeError("Pearl public projection requires eager execution for both phases")
