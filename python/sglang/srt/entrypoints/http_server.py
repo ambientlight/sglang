@@ -553,6 +553,11 @@ from sglang.srt.runtime_context import (
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
+if os.environ.get("CONTENT_FREE_LOGGING") == "1":
+    from content_free_logging import PrivacyAdminMiddleware
+
+    app.add_middleware(PrivacyAdminMiddleware)
+
 # Outermost, and registered at import so that tokenizer workers get it too.
 add_api_key_middleware(
     app, get_keys=lambda: (get_serving().api_key, get_serving().admin_api_key)
@@ -949,7 +954,10 @@ async def set_internal_state(
 
 
 # Do not import `dumper.py` to avoid dependency
-if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
+if (
+    os.environ.get("DUMPER_SERVER_PORT") == "reuse"
+    and os.environ.get("CONTENT_FREE_LOGGING") != "1"
+):
 
     @app.api_route("/dumper/{method}", methods=["POST"])
     async def _dumper_control_handler(method: str, request: Request):

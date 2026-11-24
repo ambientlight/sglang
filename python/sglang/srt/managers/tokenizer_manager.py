@@ -226,8 +226,7 @@ from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
-    pyspy_dump_schedulers,
-    trigger_cuda_user_coredump,
+    dump_crash_diagnostics,
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
@@ -696,7 +695,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.allow_auto_truncate = get_serving().allow_auto_truncate
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
-        self.crash_dump_folder = get_observability().crash_dump_folder
+        self.crash_dump_folder = (
+            None
+            if os.environ.get("CONTENT_FREE_LOGGING") == "1"
+            else get_observability().crash_dump_folder
+        )
 
         # Init model config
         self.init_model_config()
@@ -2881,6 +2884,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
+        if os.environ.get("CONTENT_FREE_LOGGING") == "1":
+            return
         self.request_logger.configure(
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
@@ -3852,7 +3857,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
         should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
-        should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
+        should_dump_nccl = envs.SGLANG_NCCL_DUMP_BEFORE_CRASH.get() and bool(
+            os.environ.get("TORCH_NCCL_DEBUG_INFO_PIPE_FILE")
+        )
+        should_dump_diagnostics = (
+            should_dump_pyspy or should_dump_cuda_coredump or should_dump_nccl
+        )
         if not self.crash_dump_folder and not should_dump_diagnostics:
             return
 
@@ -3863,6 +3873,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         else:
             self.crash_dump_performed = True
+
+        # Trigger collective evidence and bounded stacks before serializing optional requests.
+        if should_dump_diagnostics:
+            dump_crash_diagnostics(
+                pyspy=should_dump_pyspy, cuda=should_dump_cuda_coredump, nccl=should_dump_nccl
+            )
 
         # Dump requests info
         if self.crash_dump_folder:
@@ -3914,34 +3930,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
                 )
 
-        # Dump pyspy and cuda coredump
-        if should_dump_diagnostics:
-            logger.info(
-                "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
-            )
-            time.sleep(5)
-
-            scheduler_procs = collect_scheduler_processes()
-            if scheduler_procs:
-                if should_dump_pyspy:
-                    pyspy_dump_schedulers(scheduler_only=True)
-
-                if should_dump_cuda_coredump:
-                    trigger_cuda_user_coredump(scheduler_only=True)
-                    cuda_coredump_wait_secs = (
-                        envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
-                    )
-                    if cuda_coredump_wait_secs > 0:
-                        logger.info(
-                            "Waiting %.1f seconds for CUDA coredumps before exiting.",
-                            cuda_coredump_wait_secs,
-                        )
-                        time.sleep(cuda_coredump_wait_secs)
-            else:
-                logger.error(
-                    "No live scheduler processes found; skipping py-spy and CUDA coredump."
-                )
-
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
@@ -3957,7 +3945,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.error(
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
-                self.dump_requests_before_crash()
+                try:
+                    self.dump_requests_before_crash()
+                except Exception:
+                    logger.exception("Crash diagnostics failed during forced shutdown")
                 self.force_exit_handler()
                 forced = True
                 break
@@ -4515,10 +4506,12 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        logger.error(f"TokenizerManager hit an exception: {traceback.format_exc()}")
-        if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
-            func.__self__.dump_requests_before_crash()
-        kill_process_tree(os.getpid(), include_parent=True)
+        logger.exception("TokenizerManager hit an exception")
+        try:
+            if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
+                func.__self__.dump_requests_before_crash()
+        finally:
+            kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
 
@@ -4550,10 +4543,12 @@ class SignalHandler:
         )
         # Stop subprocess watchdog before killing processes to prevent false-positive
         # crash detection during normal shutdown
-        if self.tokenizer_manager._subprocess_watchdog is not None:
-            self.tokenizer_manager._subprocess_watchdog.stop()
-        self.tokenizer_manager.dump_requests_before_crash()
-        kill_process_tree(os.getpid())
+        try:
+            if self.tokenizer_manager._subprocess_watchdog is not None:
+                self.tokenizer_manager._subprocess_watchdog.stop()
+            self.tokenizer_manager.dump_requests_before_crash()
+        finally:
+            kill_process_tree(os.getpid())
 
 
 # Note: request abort handling logic

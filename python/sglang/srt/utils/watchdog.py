@@ -158,10 +158,6 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
@@ -170,14 +166,22 @@ class WatchdogRaw:
         print(file=sys.stdout, flush=True)
 
         if not self.soft:
-            if self.before_crash is not None:
+            if self.before_crash is not None and os.environ.get("CONTENT_FREE_LOGGING") != "1":
                 try:
                     self.before_crash()
                 except BaseException:  # e.g. a Rust panic; SIGQUIT must still go
                     logger.exception(f"{self.debug_name} watchdog: before_crash failed")
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
+            return
+
+        # Soft timeouts retain stack diagnostics. A callback can contain request state.
+        if os.environ.get("CONTENT_FREE_LOGGING") != "1" and self.dump_info is not None:
+            try:
+                if info_msg := self.dump_info():
+                    logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+            except Exception:
+                logger.exception("%s watchdog debug callback failed", self.debug_name)
+        pyspy_dump_schedulers()
 
 
 class SubprocessWatchdog:

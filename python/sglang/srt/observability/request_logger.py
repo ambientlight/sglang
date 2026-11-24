@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.constants import ROUTING_KEY_HEADER
@@ -135,7 +136,8 @@ class RequestLogger:
         log_requests_format: str,
         log_requests_target: Optional[List[str]],
     ):
-        self.log_requests = log_requests
+        self.content_free = os.environ.get("CONTENT_FREE_LOGGING") == "1"
+        self.log_requests = log_requests and not self.content_free
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
@@ -145,9 +147,13 @@ class RequestLogger:
         )
         self.targets = self._setup_targets()
 
-        self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
+        self.log_exceeded_ms = (
+            0 if self.content_free else envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
+        )
 
     def _setup_targets(self) -> List[logging.Logger]:
+        if self.content_free:
+            return []
         return create_log_targets(
             targets=self.log_requests_target, name_prefix=__name__
         )
@@ -159,6 +165,8 @@ class RequestLogger:
         log_requests_format: Optional[str] = None,
         log_requests_target: Optional[List[str]] = None,
     ) -> None:
+        if self.content_free:
+            return
         if log_requests is not None:
             self.log_requests = log_requests
         if log_requests_level is not None:
@@ -229,6 +237,8 @@ class RequestLogger:
         request: Optional[fastapi.Request] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
+        if self.content_free:
+            return
         max_length, _, _ = self.metadata
         max_length = max_length if max_length is not None else 2048
         headers = _extract_whitelisted_headers(request)

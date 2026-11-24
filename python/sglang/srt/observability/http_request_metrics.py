@@ -1,6 +1,10 @@
+import os
 from typing import Dict, Optional, Tuple
 
 from sglang.srt.constants import ROUTING_KEY_HEADER
+
+
+_HTTP_METHODS = frozenset(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"))
 
 
 class RefCountedGauge:
@@ -73,6 +77,7 @@ def add_http_request_metrics_middleware(app):
     from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
 
     patch_app_http_middleware(app)
+    track_routing_keys = os.environ.get("CONTENT_FREE_LOGGING") != "1"
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
@@ -80,11 +85,14 @@ def add_http_request_metrics_middleware(app):
         if metrics is None:
             return await call_next(request)
 
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get(ROUTING_KEY_HEADER)
+        # HTTP labels must never contain arbitrary user-supplied paths or verbs.
+        path, matched = _get_fastapi_request_path(request)
+        if not matched:
+            path = "unmatched"
+        method = request.method if request.method in _HTTP_METHODS else "OTHER"
+        routing_key = (
+            request.headers.get(ROUTING_KEY_HEADER) if track_routing_keys else None
+        )
 
         metrics.requests_total.labels(endpoint=path, method=method).inc()
         metrics.requests_active.labels(endpoint=path, method=method).inc()
@@ -114,6 +122,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return getattr(route, "path", request.url.path), True
+            return getattr(route, "path", "unmatched"), True
 
-    return request.url.path, False
+    return "unmatched", False

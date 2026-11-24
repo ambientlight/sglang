@@ -181,7 +181,8 @@ class RequestMetricsExporterManager:
         self.obj_skip_names = obj_skip_names or set()
         self.out_skip_names = out_skip_names or set()
         self._exporters: List[RequestMetricsExporter] = []
-        self._create_exporters()
+        if os.environ.get("CONTENT_FREE_LOGGING") != "1":
+            self._create_exporters()
 
     def _create_exporters(self) -> None:
         """Create and configure RequestMetricsExporter instances based on server args."""
