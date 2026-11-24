@@ -10,16 +10,19 @@ import time
 import uuid
 
 SOCKET = os.environ.get("PEARL_BROKER_SOCKET")
+NATIVE_IDLE_CONFIG = os.environ.get("PEARL_NATIVE_IDLE_CONFIG")
 SHAPE_DIR = os.environ.get("PEARL_SHAPE_DIR")
 _OPERATOR_MODULE = os.environ.get("PEARL_WOB_MODULE")
 OPERATOR = importlib.import_module(_OPERATOR_MODULE) if _OPERATOR_MODULE else None
 GRAPH_VERIFY = os.environ.get("PEARL_GRAPH_VERIFY") == "1"
-OBSERVE = bool(SHAPE_DIR or OPERATOR or GRAPH_VERIFY)
+OBSERVE = bool(SHAPE_DIR or OPERATOR or GRAPH_VERIFY or NATIVE_IDLE_CONFIG)
 TIMEOUT = 6.0  # broker's default worker-drain deadline is five seconds
 _rank = None
 
 
 def validate_config():
+    if NATIVE_IDLE_CONFIG and not SOCKET:
+        raise ValueError("Native Pearl idle mining requires the TP admission coordinator")
     if not SOCKET and OPERATOR is None and not GRAPH_VERIFY:
         return
     from sglang.srt.runtime_context import get_flags, get_parallel
@@ -27,6 +30,8 @@ def validate_config():
         Backend, Phase, check_cuda_graph_backend, cuda_graph_fully_disabled,
     )
     parallel = get_parallel()
+    if NATIVE_IDLE_CONFIG and parallel.tp_size != 4:
+        raise ValueError("Native Pearl idle mining requires four local tensor-parallel ranks")
     if SOCKET and (parallel.num_dp_ranks != 1 or parallel.pp_size != 1):
         raise ValueError("Pearl broker handoff requires one host-local TP group (DP1, PP1)")
     if GRAPH_VERIFY:
@@ -146,6 +151,10 @@ class Rank:
         self.last_counters = None
         self.stream = None
         self.active = None
+        self.native_idle = None
+        if NATIVE_IDLE_CONFIG:
+            from sglang.srt.pearl_native_idle import NativeIdle
+            self.native_idle = NativeIdle(index, NATIVE_IDLE_CONFIG)
 
     def _command(self, line):
         if not self.path:
@@ -176,8 +185,8 @@ class Rank:
             self.stream.close()
             self.stream = None
 
-    def receive(self, items):
-        if not items:
+    def receive(self, items, *, control=False):
+        if not items and not (control and self.native_idle):
             return
         if self.active is not True:
             self._command(f"BUSY {self.index}")

@@ -2401,7 +2401,9 @@ class Scheduler(
 
         for recv_req in recv_reqs:
             if pearl.SOCKET or pearl.OBSERVE:
-                pearl.scheduler_rank(get_parallel().tp_rank).receive(self._tokenized_requests(recv_req))
+                pearl.scheduler_rank(get_parallel().tp_rank).receive(
+                    self._tokenized_requests(recv_req), control=True
+                )
             # Before any early exit, so every request releases its CUDA IPC pool slot.
             for tokenized_req in self._tokenized_requests(recv_req):
                 if tokenized_req.positional_embed_overrides is not None:

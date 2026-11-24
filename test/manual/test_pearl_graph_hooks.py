@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 source = Path(__file__).resolve().parents[2] / "python/sglang/srt/pearl_runtime.py"
 spec = importlib.util.spec_from_file_location("graph_hook", source)
 hook = importlib.util.module_from_spec(spec)
-with patch.dict(os.environ, {"PEARL_WOB_MODULE": ""}):
+with patch.dict(os.environ, {"PEARL_WOB_MODULE": "", "PEARL_NATIVE_IDLE_CONFIG": ""}):
     spec.loader.exec_module(hook)
 
 
@@ -27,6 +27,16 @@ def runner():
 
 
 class GraphHooks(unittest.TestCase):
+    def test_native_rank_drains_before_control_and_fences_before_idle(self):
+        rank = hook.Rank(2, "/unused")
+        rank.native_idle = object()
+        order = []
+        rank._command = order.append
+        rank.receive((), control=True)
+        rank.receive((), control=True)
+        rank.idle(lambda: order.append("gpu fence"))
+        self.assertEqual(order, ["BUSY 2", "gpu fence", "IDLE 2"])
+
     def setUp(self):
         self.op = MagicMock()
         self.op.begin_graph.return_value = ("target_graph_mined", "state")
