@@ -805,8 +805,22 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Internal extension used by the Anthropic adapter. OpenAI represents tool
+    # results as ``role=tool`` messages but has no equivalent to Anthropic's
+    # ``tool_result.is_error`` bit. Keeping the bit structured until the
+    # model-specific encoder avoids flattening a failed result into an
+    # indistinguishable success.
+    is_error: Optional[bool] = None
+
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.is_error is None:
+            data.pop("is_error", None)
+        return data
 
     @model_validator(mode="after")
     def validate_assistant_tool_call_names(self):
@@ -1310,9 +1324,15 @@ class ChatCompletionRequest(PDRoutingFields):
             else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
         )
 
+        max_new_tokens = self.effective_max_tokens
+        if max_new_tokens is None:
+            # Operator defaults apply only when neither caller field supplies
+            # a limit. This is a default, never a ceiling on explicit budgets.
+            max_new_tokens = model_generation_config.get("max_new_tokens")
+
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.effective_max_tokens,
+            "max_new_tokens": max_new_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -2284,6 +2304,13 @@ class ResponsesRequest(PDRoutingFields):
                 max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
+            operator_default = default_params.get("max_new_tokens")
+            if operator_default is not None:
+                max_tokens = (
+                    operator_default
+                    if max_tokens is None
+                    else min(max_tokens, operator_default)
+                )
 
         temperature = self.temperature
         if temperature is None:
@@ -2581,6 +2608,7 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    recovery_chat: Optional[ChatCompletionRequest] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

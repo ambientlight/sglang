@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
@@ -61,6 +62,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.dsv41_tool_recovery import ResponsesToolRecovery
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -99,7 +101,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import MalformedToolCallError, ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -235,6 +237,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.msg_store: dict[str, Union[list[dict], list[OpenAIMessage]]] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+        self._dsv41_recovery = (
+            ResponsesToolRecovery()
+            if self.chat_encoding_spec == "dsv41"
+            and os.environ.get("SGLANG_RESPONSES_TOOL_RECOVERY") == "1"
+            and os.environ.get("SGLANG_DSV41_TOOL_CONTAINMENT") == "1"
+            else None
+        )
         self.enable_response_store = get_serving().enable_response_store
         self.is_disaggregated = get_disagg().disaggregation_mode != "null"
 
@@ -431,6 +440,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name = request.model
             tokenizer = self.tokenizer_manager.tokenizer
             processed_messages: Optional[MessageProcessingResult] = None
+            recovery_context = None
 
             if self.use_harmony:
                 messages, request_prompts, engine_prompts = (
@@ -447,6 +457,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request, prev_response, tokenizer, tool_adapter=tool_adapter
                 )
                 require_reasoning = processed_messages.require_reasoning
+                if getattr(processed_messages, "recovery_chat", None) is not None:
+                    recovery_context = (processed_messages.recovery_chat, raw_request)
 
         except _MediaInputValidationError as e:
             return self.create_error_response(str(e))
@@ -678,6 +690,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         created_time,
                         require_reasoning=require_reasoning,
                         tool_adapter=tool_adapter,
+                        recovery_context=recovery_context,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -710,6 +723,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_metadata,
                     require_reasoning=require_reasoning,
                     tool_adapter=tool_adapter,
+                    recovery_context=recovery_context,
                 )
             try:
                 result: Union[
@@ -724,6 +738,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_metadata,
                     require_reasoning=require_reasoning,
                     tool_adapter=tool_adapter,
+                    recovery_context=recovery_context,
                 )
                 return result
             except Exception as e:
@@ -784,6 +799,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             else None
         )
 
+        if (
+            self._dsv41_recovery
+            and chat_tools
+            and all(t.type == "function" for t in (request.tools or []))
+        ):
+            chat_request.max_completion_tokens = request.max_output_tokens
+            processed_messages.recovery_chat = chat_request
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
         engine_prompts = [engine_prompt]
@@ -848,6 +870,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         require_reasoning: bool,
         output_items: Optional[list] = None,
         tool_adapter=None,
+        recovery_context=None,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -862,6 +885,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         status = "completed"
         finish_reason = None
+        retry_usage = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = (
@@ -895,24 +919,44 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if request.is_include_output_logprobs() and isinstance(meta_info, dict)
                 else None
             )
-            output = self._make_response_output_items(
-                request,
-                self._settle_response_template_stop(
-                    final_res["text"],
-                    (
-                        meta_info.get("finish_reason")
-                        if isinstance(meta_info, dict)
-                        else None
-                    ),
+            try:
+                output = self._make_response_output_items(
                     request,
-                    final_res["text"],
-                ),
-                tokenizer,
-                output_logprobs=output_logprobs,
-                require_reasoning=require_reasoning,
-                output_ids=final_res.get("output_ids"),
-                finish_reason=meta_info.get("finish_reason") if meta_info else None,
-            )
+                    self._settle_response_template_stop(
+                        final_res["text"],
+                        (
+                            meta_info.get("finish_reason")
+                            if isinstance(meta_info, dict)
+                            else None
+                        ),
+                        request,
+                        final_res["text"],
+                    ),
+                    tokenizer,
+                    output_logprobs=output_logprobs,
+                    require_reasoning=require_reasoning,
+                    output_ids=final_res.get("output_ids"),
+                    finish_reason=meta_info.get("finish_reason") if meta_info else None,
+                )
+            except MalformedToolCallError as exc:
+                if (
+                    recovery_context is None
+                    or ((meta_info or {}).get("finish_reason") or {}).get("type")
+                    == "abort"
+                ):
+                    raise
+                original, raw = recovery_context
+                result = await self._dsv41_recovery.retry(
+                    self,
+                    original,
+                    raw,
+                    getattr(exc, "candidate_names", ()),
+                    request.request_id,
+                )
+                if result is None:
+                    raise
+                calls, retry_usage = result
+                output = self._output_items(request, None, None, calls, set(), None)
 
             if meta_info is not None:
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
@@ -949,6 +993,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = 0
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
+
+        if retry_usage is not None:
+            num_prompt_tokens += retry_usage.prompt_tokens
+            num_generated_tokens += retry_usage.completion_tokens
+            num_cached_tokens += getattr(
+                retry_usage.prompt_tokens_details, "cached_tokens", 0
+            )
+            num_reasoning_tokens += retry_usage.reasoning_tokens or 0
+            status, finish_reason = "completed", {"type": "tool_calls"}
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
@@ -1165,6 +1218,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             calls,
             incomplete_calls,
             output_logprobs,
+            finish_reason,
         )
 
     def _parse_text_output(
@@ -1245,6 +1299,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         calls: list[ToolCallItem],
         incomplete_calls: set[int],
         output_logprobs: Optional[list],
+        finish_reason: Optional[dict] = None,
     ) -> list:
         """Output items for the reasoning, the content and the calls."""
         output_items = []
@@ -1266,7 +1321,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
-                phase="commentary" if calls else "final_answer",
+                phase=(
+                    "commentary"
+                    if calls
+                    or (
+                        self.chat_encoding_spec == "dsv41"
+                        and (finish_reason or {}).get("type") != "stop"
+                    )
+                    else "final_answer"
+                ),
                 id=f"msg_{random_uuid()}",
                 content=[output_text],
                 role="assistant",
@@ -1857,6 +1920,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         tool_adapter=None,
+        recovery_context=None,
     ):
         try:
             # Update the status to "in_progress"
@@ -1876,6 +1940,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 created_time,
                 require_reasoning=require_reasoning,
                 tool_adapter=tool_adapter,
+                recovery_context=recovery_context,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -2199,6 +2264,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         tool_adapter=None,
+        recovery_context=None,
     ) -> AsyncGenerator[str, None]:
         pending: list[dict] = []
         can_call_tools = (
@@ -2215,10 +2281,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             created_time,
             require_reasoning=require_reasoning,
             tool_adapter=tool_adapter,
+            recovery_context=recovery_context,
         ):
             if not event:
                 continue
-            if not can_call_tools:
+            # DeepSeek V4.1 has no phase token. Publish progress on arrival and
+            # resolve the final phase when the message ends.
+            if not can_call_tools or self.chat_encoding_spec == "dsv41":
                 yield event
                 continue
             payload = orjson.loads(event.split("data: ", 1)[1])
@@ -2259,6 +2328,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
         tool_adapter=None,
+        recovery_context=None,
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -2496,7 +2566,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        def _close_message_item():
+        def _close_message_item(*, phase="final_answer"):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
@@ -2509,7 +2579,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role="assistant",
                 content=[text_content],
                 status="completed",
-                phase="final_answer",
+                phase=phase,
             )
             events = [
                 _send_event(
@@ -2656,9 +2726,52 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 token_calls: list[ToolCallItem] = []
                 if token_stream is not None:
-                    reasoning_chunk, delta, token_calls = token_stream.step(
-                        chunk, finish_reason
-                    )
+                    try:
+                        reasoning_chunk, delta, token_calls = token_stream.step(
+                            chunk, finish_reason
+                        )
+                    except MalformedToolCallError as exc:
+                        if (
+                            recovery_context is None
+                            or not finish_reason
+                            or finish_reason.get("type") == "abort"
+                        ):
+                            raise
+                        original, raw = recovery_context
+                        retry = asyncio.create_task(
+                            self._dsv41_recovery.retry(
+                                self,
+                                original,
+                                raw,
+                                getattr(exc, "candidate_names", ()),
+                                request.request_id,
+                            )
+                        )
+                        try:
+                            while not retry.done():
+                                done, _ = await asyncio.wait(
+                                    {retry}, timeout=self._dsv41_recovery.ping_interval
+                                )
+                                if not done:
+                                    yield ": responses-tool-recovery\n\n"
+                            result = retry.result()
+                        finally:
+                            if not retry.done():
+                                retry.cancel()
+                                await asyncio.gather(retry, return_exceptions=True)
+                        if result is None:
+                            raise
+                        token_calls, retry_usage = result
+                        delta, reasoning_chunk = "", ""
+                        finish_reason = {"type": "tool_calls"}
+                        if retry_usage is not None:
+                            prompt_tokens += retry_usage.prompt_tokens
+                            completion_tokens += retry_usage.completion_tokens
+                            total_tokens_meta = prompt_tokens + completion_tokens
+                            cached_tokens += getattr(
+                                retry_usage.prompt_tokens_details, "cached_tokens", 0
+                            )
+                            reasoning_tokens_meta += retry_usage.reasoning_tokens or 0
                     flush = False
                 else:
                     text = chunk.get("text", "") or ""
@@ -2808,7 +2921,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_reasoning_item():
                                 yield ev
                         if message_state["open"]:
-                            for ev in _close_message_item():
+                            for ev in _close_message_item(phase="commentary"):
                                 yield ev
 
                     if calls:
@@ -2939,7 +3052,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         role="assistant",
                                         content=[],
                                         status="in_progress",
-                                        phase="final_answer",
+                                        phase="commentary"
+                                        if self.chat_encoding_spec == "dsv41"
+                                        else "final_answer",
                                     ),
                                 )
                             )
@@ -3009,7 +3124,14 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         for ev in _close_reasoning_item():
             yield ev
-        for ev in _close_message_item():
+        for ev in _close_message_item(
+            phase=(
+                "commentary"
+                if self.chat_encoding_spec == "dsv41"
+                and (tool_call_states or (finish_reason or {}).get("type") != "stop")
+                else "final_answer"
+            )
+        ):
             yield ev
         for tool_index in list(tool_call_states):
             for ev in _close_tool_call_state(tool_index):

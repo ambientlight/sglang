@@ -17,7 +17,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.anthropic.serving import (
+    AnthropicServing,
+    _ThinkingSignatureCodec,
+)  # noqa: E402
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -172,6 +175,117 @@ class TestAnthropicServing(unittest.TestCase):
         return asyncio.run(
             serving.handle_messages(self._anthropic_request(stream=False), object())
         )
+
+    def test_stream_omitted_thinking_is_sealed_not_emitted(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"reasoning_content": "hidden analysis"})]),
+                _chunk([_choice({"content": "answer"})]),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ],
+        )
+        serving._thinking_signature_codec = _ThinkingSignatureCodec(b"k" * 32)
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "omitted"}
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        content_events = [
+            event for event in events if event["type"].startswith("content_block")
+        ]
+        self.assertEqual(
+            content_events[0]["content_block"],
+            {"type": "thinking", "thinking": ""},
+        )
+        self.assertFalse(
+            any(
+                event.get("delta", {}).get("type") == "thinking_delta"
+                for event in content_events
+            )
+        )
+        signature_event = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "signature_delta"
+        )
+        signature = signature_event["delta"]["signature"]
+        self.assertTrue(signature.startswith("sglang_thinking_v1."))
+        self.assertEqual(
+            serving._thinking_signature_codec.unseal(signature, "test-model"),
+            "hidden analysis",
+        )
+        text_delta = next(
+            event
+            for event in content_events
+            if event.get("delta", {}).get("type") == "text_delta"
+        )
+        self.assertEqual(text_delta["delta"]["text"], "answer")
+
+    def test_thinking_signature_codec_rejects_tamper_and_wrong_model(self):
+        codec = _ThinkingSignatureCodec(b"k" * 32)
+        signature = codec.seal("private reasoning", "model-a")
+        self.assertEqual(codec.unseal(signature, "model-a"), "private reasoning")
+        replacement = "A" if signature[-1] != "A" else "B"
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature[:-1] + replacement, "model-a")
+        with self.assertRaisesRegex(ValueError, "Invalid SGLang thinking signature"):
+            codec.unseal(signature, "model-b")
+
+    def test_sealed_thinking_history_restores_native_reasoning(self):
+        serving = self._serving()
+        serving._thinking_signature_codec = _ThinkingSignatureCodec(b"k" * 32)
+        serving.openai_serving_chat.native_reasoning_history = True
+        signature = serving._thinking_signature_codec.seal(
+            "restored private reasoning", "test-model"
+        )
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": signature,
+                        },
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant = next(
+            message for message in chat_request.messages if message.role == "assistant"
+        )
+        self.assertEqual(assistant.reasoning_content, "restored private reasoning")
+
+    def test_tool_result_error_bit_survives_anthropic_conversion(self):
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "permission denied",
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ],
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = next(
+            message for message in chat_request.messages if message.role == "tool"
+        )
+        self.assertIs(tool_message.is_error, True)
 
     def _tool_result_request(self, content, tools=None):
         overrides = {

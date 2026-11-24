@@ -4,6 +4,7 @@ request semantics."""
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -69,6 +70,10 @@ class DeepSeekRecipeChatEncodingAdapter:
         default_chat_template_kwargs: Optional[dict[str, Any]],
     ):
         self._spec = chat_encoding_spec
+        self._guard_tools = (
+            chat_encoding_spec == "dsv41"
+            and os.environ.get("SGLANG_DSV41_TOOL_CONTAINMENT") == "1"
+        )
         self.deepseek_recipe = DeepSeekRecipe.from_hf_tokenizer(
             chat_encoding_spec, tokenizer
         )
@@ -117,6 +122,18 @@ class DeepSeekRecipeChatEncodingAdapter:
         # The wire request: the handler's message dumps carry None for unset fields.
         wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
         wire_messages = _null_content_as_empty(wire["messages"])
+        if self._spec == "dsv41":
+            for message in wire_messages:
+                if message["role"] == "tool" and message.pop("is_error", False):
+                    prefix = (
+                        "Tool execution failed. Treat the following as an error result:"
+                    )
+                    content = message["content"]
+                    message["content"] = (
+                        prefix + "\n" + content
+                        if isinstance(content, str)
+                        else [{"type": "text", "text": prefix}, *content]
+                    )
         continue_final = request.continue_final_message
         task_prefix = None
         last = _trailing_assistant_turn(wire_messages)
@@ -347,7 +364,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             if request.continue_final_message
             else None
         )
-        return DeepSeekRecipeOutputParser(
+        parser = DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(
                 thinking=self._hooks.thinking_requested(request),
@@ -363,6 +380,16 @@ class DeepSeekRecipeChatEncodingAdapter:
             stop=_stop_strings(request.stop),
         )
 
+        if (
+            self._guard_tools
+            and request.tools
+            and self._hooks.tool_call_parsing_active(request)
+        ):
+            from sglang.srt.parser.dsv41_tool_transaction import ToolTransaction
+
+            return ToolTransaction(parser, (tool.function for tool in request.tools))
+        return parser
+
     def _new_responses_parser(
         self,
         request: ResponsesRequest,
@@ -370,13 +397,25 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
-        return DeepSeekRecipeOutputParser(
+        parser = DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(thinking=require_reasoning),
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
         )
+
+        # Built-in and custom tool adapters own their translations and schemas.
+        if (
+            self._guard_tools
+            and parse_tool_calls
+            and request.tools
+            and all(tool.type == "function" for tool in request.tools)
+        ):
+            from sglang.srt.parser.dsv41_tool_transaction import ToolTransaction
+
+            return ToolTransaction(parser, request.tools)
+        return parser
 
     def _tool_call_id(self, index: int, name: str, history_tool_calls_cnt: int) -> str:
         return self._hooks.tool_call_id(
