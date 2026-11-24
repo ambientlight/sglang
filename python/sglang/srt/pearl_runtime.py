@@ -15,7 +15,9 @@ SHAPE_DIR = os.environ.get("PEARL_SHAPE_DIR")
 _OPERATOR_MODULE = os.environ.get("PEARL_WOB_MODULE")
 OPERATOR = importlib.import_module(_OPERATOR_MODULE) if _OPERATOR_MODULE else None
 GRAPH_VERIFY = os.environ.get("PEARL_GRAPH_VERIFY") == "1"
-OBSERVE = bool(SHAPE_DIR or OPERATOR or GRAPH_VERIFY or NATIVE_IDLE_CONFIG)
+# Resident idle mining needs scheduler admission, but does not observe model
+# batches or change the checkpoint projection or CUDA graph replay.
+OBSERVE = bool(SHAPE_DIR or OPERATOR or GRAPH_VERIFY)
 TIMEOUT = 6.0  # broker's default worker-drain deadline is five seconds
 _rank = None
 

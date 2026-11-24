@@ -14,6 +14,17 @@ with patch.dict(os.environ, {"PEARL_WOB_MODULE": "", "PEARL_NATIVE_IDLE_CONFIG":
     spec.loader.exec_module(hook)
 
 
+class IdleOnly(unittest.TestCase):
+    def test_native_idle_keeps_admission_without_observing_inference(self):
+        idle = importlib.util.module_from_spec(spec)
+        with patch.dict(os.environ, {"PEARL_NATIVE_IDLE_CONFIG": "idle.json", "PEARL_BROKER_SOCKET": "/broker"}, clear=True):
+            spec.loader.exec_module(idle)
+        self.assertTrue(idle.SOCKET and idle.NATIVE_IDLE_CONFIG)
+        self.assertFalse(idle.OBSERVE)
+        self.assertFalse(idle.GRAPH_VERIFY)
+        self.assertIsNone(idle.OPERATOR)
+
+
 def batch(bs=1, **kwargs):
     attrs = dict(forward_mode=NS(name="TARGET_VERIFY", is_target_verify=lambda: True),
                  batch_size=bs, global_num_token_non_padded_cpu=bs * 6, ragged_verify_layout=None, spec_info=NS(draft_token_num=6), attn_tp_sequence_sharded=False)
